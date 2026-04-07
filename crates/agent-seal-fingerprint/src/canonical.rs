@@ -12,7 +12,7 @@ pub fn canonicalize_ephemeral(snapshot: &FingerprintSnapshot) -> [u8; 32] {
 
 fn canonicalize_sources(sources: &[SourceValue]) -> [u8; 32] {
     let mut ordered = sources.to_vec();
-    ordered.sort_by(|left, right| left.id.cmp(right.id));
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
 
     let mut encoded = Vec::new();
 
@@ -38,9 +38,9 @@ mod tests {
     use super::{canonicalize_ephemeral, canonicalize_stable};
     use crate::model::{FingerprintSnapshot, RuntimeKind, SourceValue, Stability};
 
-    fn source(id: &'static str, value: &'static [u8], stability: Stability) -> SourceValue {
+    fn source(id: &str, value: &'static [u8], stability: Stability) -> SourceValue {
         SourceValue {
-            id,
+            id: id.to_string(),
             value: value.to_vec(),
             confidence: 90,
             stability,

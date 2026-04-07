@@ -2,20 +2,22 @@ use crate::{
     constants::{CHUNK_SIZE, ENC_ALG_AES256_GCM, FMT_STREAM, MAGIC_BYTES, VERSION_V1},
     crypto::{decrypt_stream, encrypt_stream},
     error::SealError,
-    types::{PayloadFooter, PayloadHeader},
+    types::PayloadHeader,
 };
-use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use std::io::{Cursor, Read};
+use subtle::ConstantTimeEq;
+
+type HmacSha256 = Hmac<Sha256>;
 
 const HEADER_SIZE: usize = 4 + 2 + 2 + 2 + 4 + 32;
-const FOOTER_SIZE: usize = 32 + 32;
-const NONCE_SIZE: usize = 12;
+const NONCE_SIZE: usize = 7;
 
 pub fn pack_payload(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>, SealError> {
     let mut plaintext_bytes = Vec::new();
     plaintext.read_to_end(&mut plaintext_bytes)?;
 
-    let original_hash = sha256_array(&plaintext_bytes);
     let encrypted_bytes = encrypt_stream(Cursor::new(&plaintext_bytes), key)?;
 
     if encrypted_bytes.len() < NONCE_SIZE {
@@ -48,15 +50,9 @@ pub fn pack_payload(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>,
         header_hmac,
     };
 
-    let footer = PayloadFooter {
-        original_hash,
-        launcher_hash: [0_u8; 32],
-    };
-
-    let mut out = Vec::with_capacity(HEADER_SIZE + encrypted_bytes.len() + FOOTER_SIZE);
+    let mut out = Vec::with_capacity(HEADER_SIZE + encrypted_bytes.len());
     out.extend_from_slice(&serialize_header(&header));
     out.extend_from_slice(&encrypted_bytes);
-    out.extend_from_slice(&serialize_footer(&footer));
     Ok(out)
 }
 
@@ -67,9 +63,9 @@ pub fn unpack_payload(
     let mut payload_bytes = Vec::new();
     payload.read_to_end(&mut payload_bytes)?;
 
-    if payload_bytes.len() < HEADER_SIZE + FOOTER_SIZE {
+    if payload_bytes.len() < HEADER_SIZE {
         return Err(SealError::InvalidPayload(
-            "payload too small to contain header and footer".to_string(),
+            "payload too small to contain header and encrypted body".to_string(),
         ));
     }
 
@@ -84,14 +80,13 @@ pub fn unpack_payload(
         key,
     );
 
-    if header.header_hmac != expected_hmac {
+    if !bool::from(header.header_hmac.ct_eq(&expected_hmac)) {
         return Err(SealError::DecryptionFailed(
             "payload header authentication failed".to_string(),
         ));
     }
 
-    let footer_offset = payload_bytes.len() - FOOTER_SIZE;
-    let encrypted_bytes = &payload_bytes[HEADER_SIZE..footer_offset];
+    let encrypted_bytes = &payload_bytes[HEADER_SIZE..];
     if encrypted_bytes.len() < NONCE_SIZE {
         return Err(SealError::InvalidPayload(
             "encrypted payload missing stream nonce".to_string(),
@@ -99,14 +94,6 @@ pub fn unpack_payload(
     }
 
     let decrypted = decrypt_stream(Cursor::new(encrypted_bytes), key)?;
-
-    let footer = parse_footer(&payload_bytes[footer_offset..])?;
-    let actual_hash = sha256_array(&decrypted);
-    if footer.original_hash != actual_hash {
-        return Err(SealError::InvalidPayload(
-            "payload content hash mismatch".to_string(),
-        ));
-    }
 
     Ok((decrypted, header))
 }
@@ -219,53 +206,21 @@ fn compute_header_hmac(
 ) -> [u8; 32] {
     let header_without_hmac =
         serialize_header_without_hmac(magic, version, enc_alg, fmt_version, chunk_count);
-    let mut hasher = Sha256::new();
-    hasher.update(header_without_hmac);
-    hasher.update(key);
-    let digest = hasher.finalize();
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
+    mac.update(&header_without_hmac);
 
     let mut out = [0_u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-fn parse_footer(bytes: &[u8]) -> Result<PayloadFooter, SealError> {
-    if bytes.len() != FOOTER_SIZE {
-        return Err(SealError::InvalidPayload(
-            "payload footer length mismatch".to_string(),
-        ));
-    }
-
-    let mut original_hash = [0_u8; 32];
-    original_hash.copy_from_slice(&bytes[..32]);
-
-    let mut launcher_hash = [0_u8; 32];
-    launcher_hash.copy_from_slice(&bytes[32..64]);
-
-    Ok(PayloadFooter {
-        original_hash,
-        launcher_hash,
-    })
-}
-
-fn serialize_footer(footer: &PayloadFooter) -> [u8; FOOTER_SIZE] {
-    let mut out = [0_u8; FOOTER_SIZE];
-    out[..32].copy_from_slice(&footer.original_hash);
-    out[32..].copy_from_slice(&footer.launcher_hash);
-    out
-}
-
-fn sha256_array(data: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(data);
-    let mut out = [0_u8; 32];
-    out.copy_from_slice(&digest);
+    out.copy_from_slice(&mac.finalize().into_bytes());
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hmac::{Hmac, Mac};
     use std::io::Cursor;
+
+    type TestHmacSha256 = Hmac<Sha256>;
 
     fn patterned_bytes(len: usize) -> Vec<u8> {
         (0..len).map(|idx| (idx % 241) as u8).collect()

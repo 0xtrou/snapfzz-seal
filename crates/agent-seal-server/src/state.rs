@@ -69,15 +69,21 @@ impl ServerState {
         job
     }
 
-    pub async fn update_job<F>(&self, id: &str, updater: F) -> Option<JobStatus>
-    where
-        F: FnOnce(&mut JobStatus),
-    {
+    pub async fn update_job<E>(
+        &self,
+        id: &str,
+        updater: impl FnOnce(&mut JobStatus) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut jobs = self.jobs.write().await;
-        let job = jobs.get_mut(id)?;
-        updater(job);
-        job.updated_at = unix_ts_secs();
-        Some(job.clone())
+        let Some(current) = jobs.get(id).cloned() else {
+            return Ok(());
+        };
+
+        let mut staged = current;
+        updater(&mut staged)?;
+        staged.updated_at = unix_ts_secs();
+        jobs.insert(id.to_string(), staged);
+        Ok(())
     }
 }
 
@@ -91,6 +97,7 @@ fn unix_ts_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{JobState, ServerState};
+    use agent_seal_core::error::SealError;
 
     #[tokio::test]
     async fn create_and_get_job() {
@@ -113,14 +120,16 @@ mod tests {
             .create_job("job-2".to_string(), Some("/agent".to_string()))
             .await;
 
-        let updated = state
-            .update_job("job-2", |job| {
+        state
+            .update_job::<SealError>("job-2", |job| {
                 job.status = JobState::Ready;
                 job.output_path = Some("/tmp/output/agent.bin".to_string());
+                Ok(())
             })
             .await
             .expect("update should succeed");
 
+        let updated = state.get_job("job-2").await.expect("job should exist");
         assert_eq!(updated.status, JobState::Ready);
         assert_eq!(
             updated.output_path.as_deref(),
@@ -129,9 +138,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_job_returns_none_for_missing_job() {
+    async fn update_job_missing_job_is_noop_success() {
         let state = ServerState::new("/tmp/compile".into(), "/tmp/output".into());
-        let updated = state.update_job("missing", |_job| {}).await;
-        assert!(updated.is_none());
+        state
+            .update_job::<SealError>("missing", |_job| Ok(()))
+            .await
+            .expect("missing job should be no-op success");
+    }
+
+    #[tokio::test]
+    async fn update_job_rolls_back_when_updater_errors() {
+        let state = ServerState::new("/tmp/compile".into(), "/tmp/output".into());
+        state
+            .create_job("job-3".to_string(), Some("/agent".to_string()))
+            .await;
+
+        let err = state
+            .update_job("job-3", |job| {
+                job.status = JobState::Running;
+                Err(SealError::InvalidInput("reject".to_string()))
+            })
+            .await
+            .expect_err("updater should fail");
+        assert!(matches!(err, SealError::InvalidInput(_)));
+
+        let persisted = state.get_job("job-3").await.expect("job exists");
+        assert_eq!(persisted.status, JobState::Pending);
     }
 }

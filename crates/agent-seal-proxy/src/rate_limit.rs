@@ -1,4 +1,9 @@
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    num::NonZeroU32,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
@@ -6,10 +11,16 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct RateLimitLayer {
-    limiters: Arc<RwLock<HashMap<String, Arc<DefaultDirectRateLimiter>>>>,
+    limiters: Arc<RwLock<HashMap<String, RateLimiterState>>>,
     max_burst: NonZeroU32,
     per_second: NonZeroU32,
     global_limiter: Arc<DefaultDirectRateLimiter>,
+}
+
+#[derive(Clone)]
+struct RateLimiterState {
+    limiter: Arc<DefaultDirectRateLimiter>,
+    last_access: Instant,
 }
 
 impl RateLimitLayer {
@@ -33,17 +44,31 @@ impl RateLimitLayer {
         Ok(())
     }
 
+    pub async fn cleanup_stale_limiters(&self, max_idle: Duration) {
+        let cutoff = Instant::now() - max_idle;
+        self.limiters
+            .write()
+            .await
+            .retain(|_, state| state.last_access >= cutoff);
+    }
+
     async fn get_or_create_limiter(&self, key_id: &str) -> Arc<DefaultDirectRateLimiter> {
-        if let Some(existing) = self.limiters.read().await.get(key_id).cloned() {
-            return existing;
+        let now = Instant::now();
+        if let Some(existing) = self.limiters.write().await.get_mut(key_id) {
+            existing.last_access = now;
+            return existing.limiter.clone();
         }
 
         let quota = Quota::per_second(self.per_second).allow_burst(self.max_burst);
-        let mut limiters = self.limiters.write().await;
-        limiters
-            .entry(key_id.to_string())
-            .or_insert_with(|| Arc::new(RateLimiter::direct(quota)))
-            .clone()
+        let limiter = Arc::new(RateLimiter::direct(quota));
+        self.limiters.write().await.insert(
+            key_id.to_string(),
+            RateLimiterState {
+                limiter: limiter.clone(),
+                last_access: now,
+            },
+        );
+        limiter
     }
 }
 
@@ -61,7 +86,7 @@ fn limit_exceeded_response<T: governor::clock::Reference>(
 mod tests {
     use super::RateLimitLayer;
     use axum::http::StatusCode;
-    use std::num::NonZeroU32;
+    use std::{num::NonZeroU32, time::Duration};
 
     #[tokio::test]
     async fn under_limit_passes() {
@@ -86,5 +111,16 @@ mod tests {
         let layer = RateLimitLayer::new(NonZeroU32::new(2).unwrap(), NonZeroU32::new(100).unwrap());
         assert!(layer.check_rate_limit("key-1").await.is_ok());
         assert!(layer.check_rate_limit("key-2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_stale_limiters() {
+        let layer = RateLimitLayer::new(NonZeroU32::new(2).unwrap(), NonZeroU32::new(100).unwrap());
+        assert!(layer.check_rate_limit("key-1").await.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        layer.cleanup_stale_limiters(Duration::from_millis(1)).await;
+
+        assert!(layer.limiters.read().await.is_empty());
     }
 }

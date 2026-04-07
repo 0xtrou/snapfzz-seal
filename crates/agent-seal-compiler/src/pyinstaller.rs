@@ -58,10 +58,14 @@ fn compile_with_command(
     }
 
     command
-        .arg(format!("--distpath={}", config.output_dir.display()))
-        .arg(format!("--workpath={}", workpath.display()))
-        .arg(format!("--specpath={}", specpath.display()))
-        .arg(format!("--name={project_name}"))
+        .arg("--distpath")
+        .arg(&config.output_dir)
+        .arg("--workpath")
+        .arg(&workpath)
+        .arg("--specpath")
+        .arg(&specpath)
+        .arg("--name")
+        .arg(&project_name)
         .arg(source_file);
 
     let output = run_with_timeout(command, config.timeout_secs, command_name)?;

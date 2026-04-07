@@ -8,6 +8,8 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+hmac = "0.12"
+subtle = "2"
 aes-gcm = { workspace = true }
 aead = { workspace = true }
 aead-stream = { workspace = true }

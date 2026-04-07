@@ -49,7 +49,8 @@ fn compile_with_command(command_name: &str, config: &NuitkaConfig) -> Result<Pat
     }
 
     command
-        .arg(format!("--output-dir={}", config.output_dir.display()))
+        .arg("--output-dir")
+        .arg(&config.output_dir)
         .arg(&config.project_dir);
 
     let output = run_with_timeout(command, config.timeout_secs, command_name)?;

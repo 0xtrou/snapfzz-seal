@@ -3,6 +3,10 @@ use agent_seal_core::error::SealError;
 pub fn self_delete() -> Result<(), SealError> {
     let executable_path = std::fs::read_link("/proc/self/exe")?;
 
+    if !executable_path.exists() {
+        return Ok(());
+    }
+
     match std::fs::remove_file(&executable_path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {

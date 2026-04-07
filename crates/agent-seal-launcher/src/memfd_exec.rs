@@ -62,8 +62,12 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                 drop(stderr_read);
 
                 unsafe {
-                    nix::libc::dup2(stdout_write.as_raw_fd(), nix::libc::STDOUT_FILENO);
-                    nix::libc::dup2(stderr_write.as_raw_fd(), nix::libc::STDERR_FILENO);
+                    if nix::libc::dup2(stdout_write.as_raw_fd(), nix::libc::STDOUT_FILENO) == -1 {
+                        nix::libc::_exit(127);
+                    }
+                    if nix::libc::dup2(stderr_write.as_raw_fd(), nix::libc::STDERR_FILENO) == -1 {
+                        nix::libc::_exit(127);
+                    }
                 }
 
                 drop(stdout_write);
@@ -72,7 +76,9 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                 if let Some(cwd) = &config.cwd {
                     if let Err(err) = std::env::set_current_dir(cwd) {
                         eprintln!("failed to set cwd: {err}");
-                        std::process::exit(127);
+                        unsafe {
+                            nix::libc::_exit(127);
+                        }
                     }
                 }
 
@@ -96,8 +102,15 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                 drop(stdout_write);
                 drop(stderr_write);
 
-                let stdout = read_fd_to_string(stdout_read)?;
-                let stderr = read_fd_to_string(stderr_read)?;
+                let stdout_handle = std::thread::spawn(move || read_fd_to_string(stdout_read));
+                let stderr_handle = std::thread::spawn(move || read_fd_to_string(stderr_read));
+
+                let stdout = stdout_handle.join().map_err(|_| {
+                    SealError::InvalidInput("stdout reader thread panicked".to_string())
+                })??;
+                let stderr = stderr_handle.join().map_err(|_| {
+                    SealError::InvalidInput("stderr reader thread panicked".to_string())
+                })??;
 
                 let wait_status =
                     waitpid(child, None).map_err(|err| SealError::Io(std::io::Error::from(err)))?;

@@ -5,25 +5,21 @@ use rand::{RngCore, rngs::OsRng};
 use std::io::Read;
 use zeroize::Zeroize;
 
-const NONCE_SIZE: usize = 12;
 const STREAM_NONCE_SIZE: usize = 7;
 const TAG_SIZE: usize = 16;
 const ENCRYPTED_CHUNK_SIZE: usize = CHUNK_SIZE + TAG_SIZE;
 
 pub fn encrypt_stream(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>, SealError> {
     let mut key_copy = *key;
-    let mut full_nonce = [0_u8; NONCE_SIZE];
-    OsRng.fill_bytes(&mut full_nonce);
-
     let mut stream_nonce = [0_u8; STREAM_NONCE_SIZE];
-    stream_nonce.copy_from_slice(&full_nonce[..STREAM_NONCE_SIZE]);
+    OsRng.fill_bytes(&mut stream_nonce);
 
     let key_array = Key::<Aes256Gcm>::from(key_copy);
     let nonce_array = Nonce::<Aes256Gcm, aead_stream::StreamBE32<Aes256Gcm>>::from(stream_nonce);
     let mut encryptor = EncryptorBE32::<Aes256Gcm>::new(&key_array, &nonce_array);
 
-    let mut output = Vec::with_capacity(NONCE_SIZE);
-    output.extend_from_slice(&full_nonce);
+    let mut output = Vec::with_capacity(STREAM_NONCE_SIZE);
+    output.extend_from_slice(&stream_nonce);
 
     let first_chunk = read_chunk(&mut plaintext, CHUNK_SIZE)?;
     match first_chunk {
@@ -63,13 +59,10 @@ pub fn encrypt_stream(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8
 
 pub fn decrypt_stream(mut ciphertext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>, SealError> {
     let mut key_copy = *key;
-    let mut nonce = [0_u8; NONCE_SIZE];
-    ciphertext
-        .read_exact(&mut nonce)
-        .map_err(|err| SealError::DecryptionFailed(format!("failed to read nonce: {err}")))?;
-
     let mut stream_nonce = [0_u8; STREAM_NONCE_SIZE];
-    stream_nonce.copy_from_slice(&nonce[..STREAM_NONCE_SIZE]);
+    ciphertext
+        .read_exact(&mut stream_nonce)
+        .map_err(|err| SealError::DecryptionFailed(format!("failed to read nonce: {err}")))?;
 
     let key_array = Key::<Aes256Gcm>::from(key_copy);
     let nonce_array = Nonce::<Aes256Gcm, aead_stream::StreamBE32<Aes256Gcm>>::from(stream_nonce);
@@ -111,7 +104,6 @@ pub fn decrypt_stream(mut ciphertext: impl Read, key: &[u8; 32]) -> Result<Vec<u
 
     key_copy.zeroize();
     stream_nonce.zeroize();
-    nonce.zeroize();
     Ok(output)
 }
 
@@ -128,6 +120,7 @@ fn read_chunk(reader: &mut impl Read, max_len: usize) -> Result<Option<Vec<u8>>,
         chunk.extend_from_slice(&buffer[..read]);
     }
 
+    buffer.zeroize();
     if chunk.is_empty() {
         Ok(None)
     } else {

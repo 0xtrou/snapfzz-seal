@@ -15,12 +15,12 @@ pub fn derive_env_key(
     validate_32("stable_hash", stable_hash)?;
     validate_32("user_fingerprint", user_fingerprint)?;
 
-    let mut ikm = [0_u8; 64];
-    ikm[..32].copy_from_slice(stable_hash);
-    ikm[32..].copy_from_slice(user_fingerprint);
+    let mut fingerprint_ikm = [0_u8; 64];
+    fingerprint_ikm[..32].copy_from_slice(stable_hash);
+    fingerprint_ikm[32..].copy_from_slice(user_fingerprint);
 
-    let out = hkdf_expand_32(master_secret, &ikm, KDF_INFO_ENV)?;
-    ikm.zeroize();
+    let out = hkdf_expand_32(master_secret, &fingerprint_ikm, KDF_INFO_ENV)?;
+    fingerprint_ikm.zeroize();
     Ok(out)
 }
 
@@ -33,7 +33,7 @@ pub fn derive_session_key(
     hkdf_expand_32(env_key, ephemeral_hash, KDF_INFO_SESSION)
 }
 
-fn hkdf_expand_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Result<[u8; 32], SealError> {
+fn hkdf_expand_32(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<[u8; 32], SealError> {
     let hkdf = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut output = [0_u8; 32];
     hkdf.expand(info, &mut output)

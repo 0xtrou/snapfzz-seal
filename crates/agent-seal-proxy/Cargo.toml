@@ -23,3 +23,5 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
+subtle = { workspace = true }
+hmac = { workspace = true }

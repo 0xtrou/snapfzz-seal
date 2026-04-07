@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent_seal_core::error::SealError;
 use agent_seal_fingerprint::model::{FingerprintSnapshot, RuntimeKind, SourceValue, Stability};
+use rand::{RngCore, rngs::OsRng};
+use regex::Regex;
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ impl SandboxProvisioner {
     }
 
     pub async fn provision(&self, config: &SandboxConfig) -> Result<SandboxHandle, SealError> {
+        validate_sandbox_config(config)?;
+
         let docker = self.require_docker()?;
         let mut args: Vec<String> = vec!["run".to_string(), "-d".to_string()];
 
@@ -85,7 +89,7 @@ impl SandboxProvisioner {
         Ok(FingerprintSnapshot {
             runtime: RuntimeKind::Docker,
             stable: vec![SourceValue {
-                id: "linux.hostname",
+                id: "linux.hostname".to_string(),
                 value: hostname_value,
                 confidence: 70,
                 stability: Stability::Stable,
@@ -130,6 +134,32 @@ fn find_docker_binary() -> Option<String> {
 
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+fn validate_sandbox_config(config: &SandboxConfig) -> Result<(), SealError> {
+    let env_key_regex = Regex::new(r"^[A-Za-z_][A-Za-z0-9_]*$").expect("valid env key regex");
+
+    if config.image.trim().is_empty() || config.image.chars().any(char::is_whitespace) {
+        return Err(SealError::InvalidInput(
+            "sandbox image must be non-empty and contain no whitespace".to_string(),
+        ));
+    }
+
+    for (key, value) in &config.env {
+        if !env_key_regex.is_match(key) {
+            return Err(SealError::InvalidInput(format!(
+                "invalid environment variable key: {key}",
+            )));
+        }
+
+        if value.contains('\n') || value.contains('\r') {
+            return Err(SealError::InvalidInput(format!(
+                "invalid environment variable value for key: {key}",
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_container_id(stdout: &[u8]) -> Result<String, SealError> {
@@ -187,6 +217,7 @@ pub async fn exec_in_sandbox(
     provisioner: &SandboxProvisioner,
     handle: &SandboxHandle,
     command: &str,
+    timeout_secs: u64,
 ) -> Result<agent_seal_core::types::ExecutionResult, SealError> {
     let docker = provisioner.require_docker()?;
     let container_id = handle
@@ -202,7 +233,13 @@ pub async fn exec_in_sandbox(
         command.to_string(),
     ];
 
-    let output = run_command_allow_nonzero(docker, &args).await?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        run_command_allow_nonzero(docker, &args),
+    )
+    .await
+    .map_err(|_| SealError::InvalidInput("sandbox execution timed out".to_string()))??;
+
     Ok(agent_seal_core::types::ExecutionResult {
         exit_code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -230,9 +267,15 @@ fn unix_ts_millis() -> u64 {
         .as_millis() as u64
 }
 
+fn random_hex_4() -> String {
+    let mut bytes = [0_u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 fn new_sandbox_id() -> String {
     let now = unix_ts_millis();
-    format!("sbx-{now}")
+    format!("sbx-{now}-{}", random_hex_4())
 }
 
 #[cfg(test)]

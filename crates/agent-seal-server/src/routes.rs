@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -79,18 +80,20 @@ async fn compile(
     let job_id_for_task = job_id.clone();
 
     tokio::spawn(async move {
-        let _ = state_for_task
-            .update_job(&job_id_for_task, |job| {
+        let _: Result<_, std::convert::Infallible> = state_for_task
+            .update_job::<std::convert::Infallible>(&job_id_for_task, |job| {
                 job.status = JobState::Compiling;
                 job.error = None;
+                Ok(())
             })
             .await;
 
         if let Err(err) = tokio::fs::create_dir_all(&compile_output_dir).await {
-            let _ = state_for_task
+            let _: Result<_, std::convert::Infallible> = state_for_task
                 .update_job(&job_id_for_task, |job| {
                     job.status = JobState::Failed;
                     job.error = Some(format!("failed to create compile directory: {err}"));
+                    Ok(())
                 })
                 .await;
             return;
@@ -104,27 +107,30 @@ async fn compile(
 
         match output_path {
             Ok(Ok(path)) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Ready;
                         job.output_path = Some(path.to_string_lossy().to_string());
                         job.error = None;
+                        Ok(())
                     })
                     .await;
             }
             Ok(Err(err)) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Failed;
                         job.error = Some(err.to_string());
+                        Ok(())
                     })
                     .await;
             }
             Err(join_err) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Failed;
                         job.error = Some(format!("compile task join failure: {join_err}"));
+                        Ok(())
                     })
                     .await;
             }
@@ -185,10 +191,11 @@ async fn dispatch(
     let job_id_for_task = job_id.clone();
     let state_for_task = state.clone();
 
-    let _ = state
+    let _: Result<(), std::convert::Infallible> = state
         .update_job(&job_id, |job| {
             job.status = JobState::Dispatched;
             job.error = None;
+            Ok(())
         })
         .await;
 
@@ -198,10 +205,11 @@ async fn dispatch(
             return;
         };
         let Some(output_path) = job_snapshot.output_path else {
-            let _ = state_for_task
-                .update_job(&job_id_for_task, |job| {
+            let _: Result<_, std::convert::Infallible> = state_for_task
+                .update_job::<std::convert::Infallible>(&job_id_for_task, |job| {
                     job.status = JobState::Failed;
                     job.error = Some("job has no output artifact".to_string());
+                    Ok(())
                 })
                 .await;
             return;
@@ -210,20 +218,22 @@ async fn dispatch(
         let sandbox = match provisioner.provision(&sandbox_cfg).await {
             Ok(handle) => handle,
             Err(err) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Failed;
                         job.error = Some(format!("sandbox provision failed: {err}"));
+                        Ok(())
                     })
                     .await;
                 return;
             }
         };
 
-        let _ = state_for_task
+        let _: Result<_, std::convert::Infallible> = state_for_task
             .update_job(&job_id_for_task, |job| {
                 job.status = JobState::Running;
                 job.sandbox_id = Some(sandbox.id.clone());
+                Ok(())
             })
             .await;
 
@@ -235,10 +245,11 @@ async fn dispatch(
 
         if let Err(err) = copy_res {
             let _ = provisioner.destroy(&sandbox).await;
-            let _ = state_for_task
+            let _: Result<_, std::convert::Infallible> = state_for_task
                 .update_job(&job_id_for_task, |job| {
                     job.status = JobState::Failed;
                     job.error = Some(format!("sandbox copy failed: {err}"));
+                    Ok(())
                 })
                 .await;
             return;
@@ -248,34 +259,38 @@ async fn dispatch(
             &provisioner,
             &sandbox,
             "chmod +x /tmp/agent-sealed && /tmp/agent-sealed",
+            sandbox_cfg.timeout_secs,
         )
         .await;
         let destroy_result = provisioner.destroy(&sandbox).await;
 
         match (exec_result, destroy_result) {
             (Ok(result), Ok(())) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Completed;
                         job.result = Some(result);
                         job.error = None;
+                        Ok(())
                     })
                     .await;
             }
             (Ok(result), Err(err)) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Completed;
                         job.result = Some(result);
                         job.error = Some(format!("sandbox destroy failed: {err}"));
+                        Ok(())
                     })
                     .await;
             }
             (Err(err), _) => {
-                let _ = state_for_task
+                let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Failed;
                         job.error = Some(format!("sandbox exec failed: {err}"));
+                        Ok(())
                     })
                     .await;
             }
@@ -317,13 +332,19 @@ async fn health(State(state): State<ServerState>) -> impl IntoResponse {
     )
 }
 
+fn random_hex_4() -> String {
+    let mut bytes = [0_u8; 4];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 fn new_job_id() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::from_secs(0))
         .as_secs();
     let seq = NEXT_JOB_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("job-{now}-{seq}")
+    format!("job-{now}-{seq}-{}", random_hex_4())
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Backend {
@@ -57,7 +58,10 @@ where
     let output = match backend {
         Backend::Nuitka => match compile_nuitka(project_dir, output_dir) {
             Ok(path) => path,
-            Err(_nuitka_err) => compile_pyinstaller(project_dir, output_dir)?,
+            Err(_nuitka_err) => {
+                warn!("nuitka compilation failed, falling back to pyinstaller: {_nuitka_err}");
+                compile_pyinstaller(project_dir, output_dir)?
+            }
         },
         Backend::PyInstaller => compile_pyinstaller(project_dir, output_dir)?,
     };

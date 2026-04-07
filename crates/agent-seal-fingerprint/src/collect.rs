@@ -92,8 +92,8 @@ impl FingerprintCollector {
                     &mut stable,
                     "linux.hostname",
                     normalized.into_bytes(),
-                    92,
-                    Stability::Stable,
+                    60,
+                    Stability::SemiStable,
                 );
             }
         }
@@ -118,8 +118,8 @@ impl FingerprintCollector {
                 &mut stable,
                 "linux.cgroup_path",
                 cgroup.into_bytes(),
-                94,
-                Stability::Stable,
+                50,
+                Stability::SemiStable,
             );
         }
 
@@ -184,13 +184,13 @@ impl Default for FingerprintCollector {
 
 fn push_source(
     target: &mut Vec<SourceValue>,
-    id: &'static str,
+    id: &str,
     value: Vec<u8>,
     confidence: u8,
     stability: Stability,
 ) {
     target.push(SourceValue {
-        id,
+        id: id.to_string(),
         value,
         confidence,
         stability,
@@ -221,7 +221,7 @@ fn extract_cgroup_path(content: &str) -> Option<String> {
             continue;
         }
 
-        let normalized = path.to_ascii_lowercase();
+        let normalized = normalize_cgroup_path(path);
         if controllers.is_empty() {
             return Some(normalized);
         }
@@ -232,6 +232,52 @@ fn extract_cgroup_path(content: &str) -> Option<String> {
     }
 
     fallback
+}
+
+fn normalize_cgroup_path(path: &str) -> String {
+    let normalized = path.trim().trim_matches('/').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return "/".to_string();
+    }
+
+    let mut segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    while let Some(last) = segments.last().copied() {
+        if is_container_id_segment(last) {
+            segments.pop();
+        } else {
+            break;
+        }
+    }
+
+    if segments.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segments.join("/"))
+    }
+}
+
+fn is_container_id_segment(segment: &str) -> bool {
+    let mut cleaned = segment;
+
+    if let Some(stripped) = cleaned.strip_suffix(".scope") {
+        cleaned = stripped;
+    }
+    if let Some(stripped) = cleaned.strip_prefix("docker-") {
+        cleaned = stripped;
+    }
+    if let Some(stripped) = cleaned.strip_prefix("cri-containerd-") {
+        cleaned = stripped;
+    }
+    if let Some(stripped) = cleaned.strip_prefix("containerd-") {
+        cleaned = stripped;
+    }
+
+    let len = cleaned.len();
+    (len >= 8) && cleaned.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn filter_cmdline_allowlist(cmdline: &str) -> String {
@@ -325,7 +371,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
-    use super::FingerprintCollector;
+    use super::{FingerprintCollector, extract_cgroup_path, normalize_cgroup_path};
     use crate::model::RuntimeKind;
 
     #[test]
@@ -346,5 +392,25 @@ mod tests {
                 | RuntimeKind::GenericLinux
                 | RuntimeKind::Unknown
         ));
+    }
+
+    #[test]
+    fn normalize_cgroup_path_strips_container_id_segments() {
+        assert_eq!(
+            normalize_cgroup_path("/docker/abc123def4567890/"),
+            "/docker"
+        );
+        assert_eq!(
+            normalize_cgroup_path(
+                "/system.slice/docker-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef.scope"
+            ),
+            "/system.slice"
+        );
+    }
+
+    #[test]
+    fn extract_cgroup_path_keeps_structural_prefix() {
+        let content = "0::/docker/abc123def4567890\n";
+        assert_eq!(extract_cgroup_path(content).as_deref(), Some("/docker"));
     }
 }

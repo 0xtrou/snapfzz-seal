@@ -1,4 +1,5 @@
 use crate::error::SealError;
+use subtle::ConstantTimeEq;
 
 #[cfg(target_os = "linux")]
 use sha2::{Digest, Sha256};
@@ -42,11 +43,11 @@ pub fn verify_tamper(expected_hash: &[u8]) -> Result<(), SealError> {
     }
 
     let current_hash = compute_binary_hash()?;
-    if current_hash.as_slice() != expected_hash {
-        return Err(SealError::TamperDetected);
+    if current_hash.ct_eq(expected_hash).into() {
+        Ok(())
+    } else {
+        Err(SealError::TamperDetected)
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
