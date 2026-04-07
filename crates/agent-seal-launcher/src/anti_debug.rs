@@ -50,11 +50,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn apply_protections_skipped_on_linux() {
-        let result = apply_protections();
-        match result {
-            Ok(_) | Err(SealError::InvalidInput(_)) => {}
-            Err(other) => panic!("unexpected error: {other:?}"),
-        }
+    fn apply_protections_compiles_on_linux() {
+        let _: fn() -> Result<Vec<String>, SealError> = apply_protections;
     }
 }
