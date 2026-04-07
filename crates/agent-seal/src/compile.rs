@@ -37,3 +37,34 @@ pub fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
     agent_seal_compiler::run(compiler_cli).map_err(Into::into)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, CompileBackend, run};
+
+    fn compile_cli(backend: CompileBackend) -> Cli {
+        Cli {
+            project: std::path::PathBuf::from("/definitely/missing/project"),
+            user_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            sandbox_fingerprint: "auto".to_string(),
+            output: std::env::temp_dir().join("agent-seal-test-output.asl"),
+            launcher: None,
+            backend,
+        }
+    }
+
+    #[test]
+    fn run_errors_for_nonexistent_project_with_nuitka_backend() {
+        let result = run(compile_cli(CompileBackend::Nuitka));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_errors_for_nonexistent_project_with_pyinstaller_backend() {
+        let result = run(compile_cli(CompileBackend::Pyinstaller));
+
+        assert!(result.is_err());
+    }
+}

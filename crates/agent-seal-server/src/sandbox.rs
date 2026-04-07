@@ -282,14 +282,16 @@ fn new_sandbox_id() -> String {
 mod tests {
     use std::{
         fs,
+        os::unix::fs::PermissionsExt,
         path::Path,
         process::Command as StdCommand,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        SandboxConfig, SandboxHandle, SandboxProvisioner, find_docker_binary, is_executable,
-        new_sandbox_id, parse_container_id, random_hex_4, unix_ts_millis, validate_sandbox_config,
+        SandboxConfig, SandboxHandle, SandboxProvisioner, exec_in_sandbox, find_docker_binary,
+        is_executable, new_sandbox_id, parse_container_id, random_hex_4, unix_ts_millis,
+        validate_sandbox_config,
     };
 
     fn temp_path(prefix: &str) -> std::path::PathBuf {
@@ -321,6 +323,19 @@ mod tests {
         }
     }
 
+    fn make_executable_script(contents: &str) -> std::path::PathBuf {
+        let dir = temp_path("sandbox-script");
+        fs::create_dir_all(&dir).expect("script temp dir should be created");
+        let script = dir.join("docker-stub.sh");
+        fs::write(&script, contents).expect("script should be written");
+        let mut perms = fs::metadata(&script)
+            .expect("script metadata should be readable")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).expect("script should be executable");
+        script
+    }
+
     fn assert_probe_success(output: std::process::Output) {
         assert!(
             output.status.success(),
@@ -328,6 +343,14 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn fixture_sandbox_handle() -> SandboxHandle {
+        SandboxHandle {
+            id: "sbx-test".to_string(),
+            container_id: Some("container-123".to_string()),
+            config: fixture_sandbox_config(),
+        }
     }
 
     #[test]
@@ -429,6 +452,135 @@ mod tests {
             .require_docker()
             .expect_err("missing docker should error");
         assert!(err.to_string().contains("docker binary not found"));
+    }
+
+    #[tokio::test]
+    async fn provision_fails_when_docker_binary_missing() {
+        let provisioner = SandboxProvisioner { docker_bin: None };
+
+        let err = provisioner
+            .provision(&fixture_sandbox_config())
+            .await
+            .expect_err("missing docker binary should fail provision");
+
+        assert!(err.to_string().contains("docker binary not found"));
+    }
+
+    #[tokio::test]
+    async fn provision_fails_when_docker_command_returns_nonzero() {
+        let script = make_executable_script("#!/bin/sh\necho docker exploded 1>&2\nexit 9\n");
+        let provisioner = SandboxProvisioner {
+            docker_bin: Some(script.to_string_lossy().to_string()),
+        };
+
+        let err = provisioner
+            .provision(&fixture_sandbox_config())
+            .await
+            .expect_err("nonzero docker command should fail provision");
+
+        assert!(err.to_string().contains("command failed:"));
+        assert!(err.to_string().contains("docker exploded"));
+
+        fs::remove_dir_all(script.parent().expect("script parent should exist"))
+            .expect("script temp dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn provision_fails_when_docker_binary_path_is_invalid() {
+        let missing_bin = temp_path("missing-docker-bin");
+        let provisioner = SandboxProvisioner {
+            docker_bin: Some(missing_bin.to_string_lossy().to_string()),
+        };
+
+        let err = provisioner
+            .provision(&fixture_sandbox_config())
+            .await
+            .expect_err("invalid docker path should fail provision");
+
+        assert!(
+            err.to_string().contains("No such file")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("os error")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_docker_binary_missing() {
+        let provisioner = SandboxProvisioner { docker_bin: None };
+
+        let err = exec_in_sandbox(&provisioner, &fixture_sandbox_handle(), "echo hi", 1)
+            .await
+            .expect_err("missing docker binary should fail run");
+
+        assert!(err.to_string().contains("docker binary not found"));
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_docker_binary_path_is_invalid() {
+        let missing_bin = temp_path("missing-docker-run");
+        let provisioner = SandboxProvisioner {
+            docker_bin: Some(missing_bin.to_string_lossy().to_string()),
+        };
+
+        let err = exec_in_sandbox(&provisioner, &fixture_sandbox_handle(), "echo hi", 1)
+            .await
+            .expect_err("invalid docker path should fail run");
+
+        assert!(
+            err.to_string().contains("No such file")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("os error")
+        );
+    }
+
+    #[tokio::test]
+    async fn destroy_fails_when_docker_binary_missing() {
+        let provisioner = SandboxProvisioner { docker_bin: None };
+
+        let err = provisioner
+            .destroy(&fixture_sandbox_handle())
+            .await
+            .expect_err("missing docker binary should fail destroy");
+
+        assert!(err.to_string().contains("docker binary not found"));
+    }
+
+    #[tokio::test]
+    async fn destroy_fails_when_docker_command_returns_nonzero() {
+        let script = make_executable_script("#!/bin/sh\necho cannot remove 1>&2\nexit 3\n");
+        let provisioner = SandboxProvisioner {
+            docker_bin: Some(script.to_string_lossy().to_string()),
+        };
+
+        let err = provisioner
+            .destroy(&fixture_sandbox_handle())
+            .await
+            .expect_err("nonzero docker command should fail destroy");
+
+        assert!(err.to_string().contains("command failed:"));
+        assert!(err.to_string().contains("cannot remove"));
+
+        fs::remove_dir_all(script.parent().expect("script parent should exist"))
+            .expect("script temp dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn destroy_fails_when_docker_binary_path_is_invalid() {
+        let missing_bin = temp_path("missing-docker-destroy");
+        let provisioner = SandboxProvisioner {
+            docker_bin: Some(missing_bin.to_string_lossy().to_string()),
+        };
+
+        let err = provisioner
+            .destroy(&fixture_sandbox_handle())
+            .await
+            .expect_err("invalid docker path should fail destroy");
+
+        assert!(
+            err.to_string().contains("No such file")
+                || err.to_string().contains("not found")
+                || err.to_string().contains("os error")
+        );
     }
 
     #[test]

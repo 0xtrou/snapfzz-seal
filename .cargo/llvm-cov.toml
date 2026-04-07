@@ -1,0 +1,6 @@
+[html]
+output-dir = "target/llvm-cov/html"
+
+exclude-files = [
+    "crates/*/src/main.rs",
+]

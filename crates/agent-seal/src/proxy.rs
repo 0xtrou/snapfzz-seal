@@ -49,3 +49,52 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, run};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct ParseCli {
+        #[command(flatten)]
+        cli: Cli,
+    }
+
+    #[test]
+    fn cli_uses_expected_defaults() {
+        let parsed = ParseCli::parse_from(["test", "--provider-key", "pk_test"]);
+
+        assert_eq!(parsed.cli.provider_key, "pk_test");
+        assert_eq!(parsed.cli.provider, "openai");
+        assert_eq!(parsed.cli.bind, "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn cli_maps_all_args() {
+        let parsed = ParseCli::parse_from([
+            "test",
+            "--provider-key",
+            "pk_live",
+            "--provider",
+            "anthropic",
+            "--bind",
+            "127.0.0.1:19080",
+        ]);
+
+        assert_eq!(parsed.cli.provider_key, "pk_live");
+        assert_eq!(parsed.cli.provider, "anthropic");
+        assert_eq!(parsed.cli.bind, "127.0.0.1:19080");
+    }
+
+    #[test]
+    fn run_returns_error_for_invalid_bind_address_after_runtime_setup() {
+        let result = run(Cli {
+            provider_key: "pk_test".to_string(),
+            provider: "openai".to_string(),
+            bind: "definitely-not-an-address".to_string(),
+        });
+
+        assert!(result.is_err());
+    }
+}
