@@ -274,7 +274,7 @@ fn extract_exit_code(status: WaitStatus) -> i32 {
         WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
         WaitStatus::Stopped(_, signal) => 128 + signal as i32,
         WaitStatus::Continued(_) => 0,
-        WaitStatus::StillAlive => 0,
+        _ => 1,
     }
 }
 
