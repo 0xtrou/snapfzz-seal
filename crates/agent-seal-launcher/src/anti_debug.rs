@@ -37,25 +37,23 @@ pub fn apply_protections() -> Result<Vec<String>, SealError> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn apply_protections_returns_vec_or_linux_ptrace_error() {
-        // ptrace::traceme() conflicts with coverage instrumentation
-        // and CI process tracing — only test the non-linux (no-op) path
-        #[cfg(target_os = "linux")]
-        {
-            // ptrace::traceme() conflicts with coverage instrumentation
-            // and CI process tracing — skip actual syscall on Linux.
-            // The non-linux (no-op) path is tested below.
-            return;
-        }
-
+    fn apply_protections_returns_empty_vec_on_non_linux() {
         match apply_protections() {
             Ok(protections) => {
-                let _: Vec<String> = protections;
+                assert!(protections.is_empty());
             }
-            Err(SealError::InvalidInput(message)) => {
-                assert!(message.contains("ptrace TRACEME rejected"));
-            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn apply_protections_skipped_on_linux() {
+        let result = apply_protections();
+        match result {
+            Ok(_) | Err(SealError::InvalidInput(_)) => {}
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
