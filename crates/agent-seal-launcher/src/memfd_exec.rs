@@ -140,11 +140,9 @@ impl MemfdOps for KernelMemfdOps {
         use std::io::Write;
         use std::os::fd::FromRawFd;
 
-        let dup_fd = unsafe {
-            nix::unistd::dup(fd.as_raw_fd())
-                .map_err(|err| SealError::Io(std::io::Error::from(err)))?
-        };
-        let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+        let dup_fd = nix::unistd::dup(fd.as_raw_fd())
+            .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+        let file = std::fs::File::from_raw_fd(dup_fd);
         if data.is_empty() {
             return Ok(());
         }
@@ -156,11 +154,9 @@ impl MemfdOps for KernelMemfdOps {
     fn seal_memfd(&self, fd: &OwnedFd) -> Result<(), SealError> {
         use std::os::fd::FromRawFd;
 
-        let dup_fd = unsafe {
-            nix::unistd::dup(fd.as_raw_fd())
-                .map_err(|err| SealError::Io(std::io::Error::from(err)))?
-        };
-        let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+        let dup_fd = nix::unistd::dup(fd.as_raw_fd())
+            .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+        let file = std::fs::File::from_raw_fd(dup_fd);
         let memfd = memfd::Memfd::try_from_file(file)
             .map_err(|_| SealError::InvalidInput("fd is not a memfd".to_string()))?;
 
