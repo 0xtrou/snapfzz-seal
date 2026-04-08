@@ -1374,6 +1374,119 @@ mod tests {
         }
     }
 
+    #[test]
+    fn heartbeat_timeout_uses_env_when_positive_integer() {
+        let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", "7");
+        }
+
+        assert_eq!(heartbeat_timeout_from_env(), Duration::from_secs(7));
+
+        restore_env_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", previous.as_deref());
+    }
+
+    #[test]
+    fn execute_interactive_with_mock_ops_relays_stdout_and_stderr() {
+        let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", "1");
+        }
+
+        let ops = MockMemfdOps::new();
+        let config = ExecConfig {
+            args: vec!["payload-bin".into(), "--flag".into()],
+            env: vec![("A".into(), "1".into())],
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 1,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let executor = MemfdExecutor::new(ops);
+        let handle = executor.execute_interactive(b"payload", &config).unwrap();
+        let result = handle.relay_test_input(b"ignored input").unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "stdout:0\n");
+        assert_eq!(result.stderr, "stderr:payload-bin\n");
+
+        let log = executor.ops.read_log();
+        let lines: Vec<_> = log.lines().collect();
+        assert_eq!(lines[0], "create:agent-seal-payload");
+        assert_eq!(lines[1], "write:7");
+        assert_eq!(lines[2], "seal");
+        assert_eq!(lines[3], "exec:2:1");
+
+        restore_env_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", previous.as_deref());
+    }
+
+    #[test]
+    fn execute_interactive_respects_max_output_bytes_limit() {
+        let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", "1");
+        }
+
+        let ops = MockMemfdOps::new();
+        let config = ExecConfig {
+            args: vec!["payload-bin".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 1,
+            max_output_bytes: Some(0),
+        };
+
+        let executor = MemfdExecutor::new(ops);
+        let handle = executor.execute_interactive(b"payload", &config).unwrap();
+        let result = handle.wait().unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+
+        restore_env_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", previous.as_deref());
+    }
+
+    #[test]
+    fn write_all_ignore_broken_pipe_returns_ok_for_broken_pipe() {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        drop(read_fd);
+        let mut writer = std::fs::File::from(write_fd);
+
+        write_all_ignore_broken_pipe(&mut writer, b"hello").unwrap();
+    }
+
+    #[test]
+    fn poll_readable_detects_ready_and_timeout() {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+
+        let timed_out = poll_readable(read_fd.as_raw_fd(), Duration::from_millis(10)).unwrap();
+        assert!(!timed_out);
+
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(b"x").unwrap();
+        writer.flush().unwrap();
+
+        let ready = poll_readable(read_fd.as_raw_fd(), Duration::from_millis(50)).unwrap();
+        assert!(ready);
+
+        drop(writer);
+        drop(read_fd);
+    }
+
+    #[test]
+    fn fork_error_to_seal_maps_known_errnos() {
+        let eagain = fork_error_to_seal(Errno::EAGAIN);
+        let enomem = fork_error_to_seal(Errno::ENOMEM);
+        let ebadf = fork_error_to_seal(Errno::EBADF);
+
+        assert!(matches!(eagain, SealError::InvalidInput(message) if message.contains("EAGAIN")));
+        assert!(matches!(enomem, SealError::InvalidInput(message) if message.contains("ENOMEM")));
+        assert!(matches!(ebadf, SealError::Io(_)));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn kernel_memfd_ops_handles_empty_write_chunk() {

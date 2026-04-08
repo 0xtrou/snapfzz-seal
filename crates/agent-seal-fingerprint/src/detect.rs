@@ -100,4 +100,55 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+
+    fn run_detect_child(test_name: &str, container: &str, expected: RuntimeKind) {
+        if std::env::var_os("AGENT_SEAL_TEST_DETECT_RUNTIME_CHILD").is_some() {
+            let runtime = detect_runtime();
+            assert_eq!(runtime, expected);
+            return;
+        }
+
+        let current_exe = std::env::current_exe().expect("current test binary path should resolve");
+        let output = std::process::Command::new(current_exe)
+            .arg("--exact")
+            .arg(test_name)
+            .env("AGENT_SEAL_TEST_DETECT_RUNTIME_CHILD", "1")
+            .env("container", container)
+            .output()
+            .expect("child test process should execute");
+
+        assert!(
+            output.status.success(),
+            "child process should pass: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn detect_runtime_honors_nspawn_container_env() {
+        run_detect_child(
+            "detect::tests::detect_runtime_honors_nspawn_container_env",
+            "systemd-nspawn",
+            RuntimeKind::Nspawn,
+        );
+    }
+
+    #[test]
+    fn detect_runtime_honors_kata_container_env() {
+        run_detect_child(
+            "detect::tests::detect_runtime_honors_kata_container_env",
+            "kata-runtime",
+            RuntimeKind::Kata,
+        );
+    }
+
+    #[test]
+    fn detect_runtime_honors_docker_container_env() {
+        run_detect_child(
+            "detect::tests::detect_runtime_honors_docker_container_env",
+            "docker",
+            RuntimeKind::Docker,
+        );
+    }
 }

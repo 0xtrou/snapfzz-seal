@@ -102,4 +102,91 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn signed_binary_verifies_with_explicit_pubkey_file() {
+        let dir = tmp("verify-explicit-pubkey");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let (secret, public) = agent_seal_core::signing::keygen();
+        let sig = agent_seal_core::signing::sign(&secret, b"payload").unwrap();
+
+        let bin = dir.join("app.bin");
+        fs::write(
+            &bin,
+            [b"payload".as_slice(), b"ASL\x02", &sig, &public].concat(),
+        )
+        .unwrap();
+
+        let pubkey_path = dir.join("builder_public.key");
+        fs::write(&pubkey_path, hex::encode(public)).unwrap();
+
+        assert!(
+            run(Cli {
+                binary: bin,
+                pubkey: Some(pubkey_path),
+            })
+            .is_ok()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signed_binary_with_tampered_payload_reports_invalid_but_returns_ok() {
+        let dir = tmp("verify-invalid-signature");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let (secret, public) = agent_seal_core::signing::keygen();
+        let sig = agent_seal_core::signing::sign(&secret, b"payload").unwrap();
+
+        let bin = dir.join("app.bin");
+        fs::write(
+            &bin,
+            [b"payload-tampered".as_slice(), b"ASL\x02", &sig, &public].concat(),
+        )
+        .unwrap();
+
+        assert!(
+            run(Cli {
+                binary: bin,
+                pubkey: None,
+            })
+            .is_ok()
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn run_errors_when_pubkey_file_is_not_32_bytes() {
+        let dir = tmp("verify-bad-pubkey");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let (secret, public) = agent_seal_core::signing::keygen();
+        let sig = agent_seal_core::signing::sign(&secret, b"payload").unwrap();
+
+        let bin = dir.join("app.bin");
+        fs::write(
+            &bin,
+            [b"payload".as_slice(), b"ASL\x02", &sig, &public].concat(),
+        )
+        .unwrap();
+
+        let bad_pubkey = dir.join("bad.pub");
+        fs::write(&bad_pubkey, "abcd").unwrap();
+
+        let err = run(Cli {
+            binary: bin,
+            pubkey: Some(bad_pubkey),
+        })
+        .expect_err("short pubkey should fail");
+
+        assert!(err.to_string().contains("public key must be 32 bytes"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }
