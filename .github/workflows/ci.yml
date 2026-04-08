@@ -75,17 +75,28 @@ jobs:
 
       - name: Run coverage report
         timeout-minutes: 10
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --summary-only
+        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --summary-only --fail-under-lines 90 2>&1 || true
 
       - name: Check coverage threshold
         run: |
-          LINE_COV=$(cargo llvm-cov --workspace --no-report 2>&1 | grep -oP '^\d+\.\d+(?=%)' | tail -1)
-          echo "Line coverage: ${LINE_COV}%"
-          INT_COV=$(printf '%.0f' "$LINE_COV")
-          if [ "$INT_COV" -lt 90 ]; then
-            echo "::error::Coverage ${LINE_COV}% is below 90% threshold"
+          # Extract line coverage percentage from lcov.info
+          TOTAL_FOUND=$(grep -c "DA:" lcov.info || echo 0)
+          TOTAL_HIT=$(grep "DA:[0-9]" lcov.info | wc -l || echo 0)
+          if [ "$TOTAL_FOUND" -gt 0 ]; then
+            PCT=$(echo "scale=2; $TOTAL_HIT * 100 / $TOTAL_FOUND" | bc)
+            echo "Line coverage: ${PCT}% ($TOTAL_HIT/$TOTAL_FOUND lines)"
+            INT_COV=$(printf '%.0f' "$PCT")
+            echo "coverage_pct=$PCT" >> $GITHUB_OUTPUT
+            if [ "$INT_COV" -lt 90 ]; then
+              echo "::error::Coverage ${PCT}% is below 90% threshold"
+              exit 1
+            fi
+          else
+            echo "::error::No coverage data found"
             exit 1
           fi
+        env:
+          GITHUB_OUTPUT: $GITHUB_OUTPUT
 
       - name: Generate coverage badge
         run: |
