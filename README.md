@@ -6,10 +6,13 @@
 
 Agent Seal is an encrypted, sandbox-bound agent delivery system for Linux. It compiles agents into sealed payloads, binds decryption to runtime fingerprints, executes from memory, and avoids shipping API keys in delivered binaries.
 
-The primary interface is a single binary, `seal`, with four subcommands:
+The primary interface is a single binary, `seal`, with seven subcommands:
 
 - `seal compile`: compile and seal an agent payload
 - `seal launch`: launch a sealed agent payload
+- `seal keygen`: generate Ed25519 signing keys
+- `seal sign`: sign a sealed binary with a builder key
+- `seal verify`: verify a sealed binary signature
 - `seal server`: start the orchestration API server
 - `seal proxy`: start the LLM access proxy
 
@@ -35,6 +38,15 @@ The primary interface is a single binary, `seal`, with four subcommands:
         │                      │ from memfd       │                       │
         │                      └─────────┬────────┘                       │
         │                                │                                │
+        │                ┌───────────────▼───────────────┐                │
+        │                │      builder signing flow      │                │
+        │                └───────┬─────────┬──────────────┘                │
+        │                        │         │                               │
+        │              ┌─────────▼────┐ ┌──▼─────────┐ ┌─────────▼────┐    │
+        │              │ seal keygen  │ │ seal sign  │ │ seal verify  │    │
+        │              │ generate keys│ │ append sig │ │ verify sig   │    │
+        │              └──────────────┘ └────────────┘ └──────────────┘    │
+        │                                │                                │
         └──────────────────────┬─────────▼────────┬───────────────────────┘
                                │ agent-seal-core  │
                                │ crypto + payload │
@@ -51,9 +63,10 @@ The primary interface is a single binary, `seal`, with four subcommands:
 1. **Compile**: `seal compile` turns source projects into Linux executables and assembles a sealed payload.
 2. **Encrypt**: the artifact is chunk-encrypted with AES-256-GCM and sealed with versioned payload metadata.
 3. **Ship**: launcher + encrypted payload are distributed to target environments.
-4. **Run**: `seal launch` derives runtime keys from fingerprint input and attempts payload decrypt.
-5. **Capture**: execution output is collected (stdout/stderr/exit code) for orchestration.
-6. **Destroy**: runtime design aims to minimize residual plaintext footprint.
+4. **Sign**: builders sign sealed binaries with Ed25519 keys.
+5. **Run**: `seal launch` verifies signature, collects fingerprint, derives a decryption key, decrypts payload, verifies tamper hash, then executes from memory.
+6. **Capture**: execution output is collected (stdout/stderr/exit code) for orchestration.
+7. **Destroy**: runtime design aims to minimize residual plaintext footprint.
 
 ## Encryption Design
 
@@ -76,6 +89,9 @@ The primary interface is a single binary, `seal`, with four subcommands:
 │ magic    │ version │ enc_alg │ fmt_ver  │ chunk_count│ header_hmac │
 │ ASL\x01  │ u16     │ u16     │ u16      │ u32        │ [u8; 32]    │
 └──────────┴─────────┴─────────┴──────────┴────────────┴─────────────┘
+┌──────────────┐
+│ mode_byte[1] │ 0x00=batch, 0x01=interactive
+└──────────────┘
 ┌──────────────────────────────────────────────────────────────────────┐
 │ chunk records: [len:u32][ciphertext+tag] * N                        │
 └──────────────────────────────────────────────────────────────────────┘
@@ -104,6 +120,7 @@ Current target runtimes:
 - Casual payload extraction from static binaries
 - Running encrypted payload in an unrelated sandbox environment
 - Direct exposure of provider API keys from shipped agent artifacts
+- Payload tampering: Ed25519 signatures verify builder identity and payload integrity
 
 ### Not protected against
 
@@ -117,12 +134,12 @@ In short: Agent Seal raises attacker cost and narrows abuse windows; it is not a
 
 | Crate | Type | Role |
 |---|---|---|
-| `agent-seal` | bin | Umbrella CLI that provides `seal compile`, `seal launch`, `seal server`, and `seal proxy` |
-| `agent-seal-core` | lib | Shared types, crypto boundaries, payload metadata, derivation primitives |
+| `agent-seal` | bin | Umbrella CLI that provides `seal compile`, `seal launch`, `seal keygen`, `seal sign`, `seal verify`, `seal server`, and `seal proxy` |
+| `agent-seal-core` | lib | Shared types, crypto boundaries, payload metadata, derivation primitives, and Ed25519 signing primitives |
 | `agent-seal-fingerprint` | lib | Fingerprint collection, canonicalization, mismatch detection |
 | `agent-seal-launcher` | bin | Runtime launcher for decrypt and execution flow (Linux only) |
 | `agent-seal-compiler` | lib + bin | Build and seal pipeline, backend adapters (`nuitka`, `pyinstaller`) |
-| `agent-seal-proxy` | lib + bin | LLM provider proxy with auth, rate limiting, and SSE streaming |
+| `agent-seal-proxy` | lib + bin | LLM provider proxy with auth, rate limiting, and SSE streaming (deprecated in v0.2, retained for dev-only use) |
 | `agent-seal-server` | bin | Orchestration API that composes compile, dispatch, and job management |
 
 ## Installation
@@ -170,6 +187,25 @@ seal server --bind 0.0.0.0:9090 --compile-dir ./.agent-seal/compile --output-dir
 seal proxy --provider-key "$OPENAI_API_KEY" --provider openai --bind 0.0.0.0:8080
 ```
 
+### Builder signing workflow
+
+```bash
+# 1. Generate a signing keypair (one-time per builder)
+seal keygen
+
+# 2. Compile and seal an agent
+seal compile --project ./agent --user-fingerprint $USER_FP --output ./agent.sealed
+
+# 3. Sign the sealed binary
+seal sign --key ~/.agent-seal/keys/key --binary ./agent.sealed
+
+# 4. Distribute agent.sealed + key.pub to enterprise
+
+# 5. Enterprise verifies before running
+seal verify --binary ./agent.sealed --pubkey ./key.pub
+seal launch --payload ./agent.sealed --user-fingerprint $USER_FP
+```
+
 Individual crate binaries are still available for crate-local development, but `seal` is the primary UX.
 
 ---
@@ -189,9 +225,12 @@ Options:
   --output <PATH>                  Output path for the sealed binary
   --launcher <PATH>                Path to agent-seal-launcher binary (for assembly)
   --backend <BACKEND>              Compile backend [default: nuitka] (nuitka | pyinstaller)
+  --mode <MODE>                    Agent execution mode [default: batch] (batch | interactive)
 ```
 
 The `--launcher` flag embeds the launcher binary into the output, producing a single file that contains both the runtime and the encrypted payload. Without it, only the encrypted payload is produced.
+
+Batch mode runs the agent once and captures output. Interactive mode keeps the agent running with stdin/stdout pipes for multi-turn conversations.
 
 **Examples:**
 
@@ -221,6 +260,70 @@ seal compile \
 
 ---
 
+### `seal keygen` — Generate signing keys
+
+Generates an Ed25519 keypair for builder signing. Creates two files:
+
+- `key` — 64-hex secret key (KEEP SECRET)
+- `key.pub` — 64-hex public key (safe to distribute)
+
+```text
+Usage: seal keygen [OPTIONS]
+Options:
+  --keys-dir <PATH>    Output directory for key files [default: ~/.agent-seal/keys]
+```
+
+**Examples:**
+
+```bash
+seal keygen
+seal keygen --keys-dir ./my-keys
+```
+
+---
+
+### `seal sign` — Sign a sealed binary
+
+Appends an Ed25519 signature and the builder's public key to a sealed binary. The signature covers all bytes preceding it, header + mode + chunks + footer.
+
+```text
+Usage: seal sign [OPTIONS] --key <KEY> --binary <BINARY>
+Options:
+  --key <PATH>       Path to 64-hex secret key file
+  --binary <PATH>    Path to sealed binary to sign
+```
+
+**Examples:**
+
+```bash
+seal sign --key ~/.agent-seal/keys/key --binary ./my-agent.sealed
+```
+
+---
+
+### `seal verify` — Verify a sealed binary's signature
+
+Verifies the Ed25519 signature on a sealed binary. If `--pubkey` is not provided, the embedded public key (appended by `seal sign`) is used. This implements Trust-on-First-Use (TOFU): enterprises trust the first public key they see per builder.
+
+```text
+Usage: seal verify [OPTIONS] --binary <BINARY>
+Options:
+  --binary <PATH>        Path to sealed binary to verify
+  --pubkey <PATH>        Path to 64-hex public key file (optional; uses embedded key if omitted)
+```
+
+**Examples:**
+
+```bash
+# Verify with embedded public key
+seal verify --binary ./my-agent.sealed
+
+# Verify with explicit public key
+seal verify --binary ./my-agent.sealed --pubkey ./builder-key.pub
+```
+
+---
+
 ### `seal launch` — Execute a sealed agent
 
 Decrypts and executes a sealed payload from memory using memfd + fexecve. Derives decryption keys from the master secret, runtime fingerprint, and user fingerprint. Linux only.
@@ -231,12 +334,20 @@ Options:
   --payload <PATH>                Path to sealed binary or encrypted payload
   --fingerprint-mode <MODE>       Fingerprint collection mode [default: stable] (stable | session)
   --user-fingerprint <HEX>        64-hex user identity (32 bytes) [required]
+  --mode <MODE>                   Execution mode [default: batch] (batch | interactive)
+  --max-lifetime <SECS>           Maximum process lifetime in seconds (interactive mode)
+  --grace-period <SECS>           Grace period before SIGKILL after lifetime expires [default: 30]
   --verbose                       Enable debug-level logging
 ```
 
 **Fingerprint modes:**
 - `stable` — Uses only restart-survivable signals (machine-id, hostname, kernel, cgroup). Best for persistent environments.
 - `session` — Includes ephemeral signals (namespace inodes, UIDs). Best for short-lived containers where you want stricter binding.
+
+#### Execution modes
+
+- **batch** (default): Launches the agent, captures stdout/stderr/exit code, returns `ExecutionResult`. One-shot execution.
+- **interactive**: Forks the agent with stdin/stdout/stderr pipes. The launcher becomes a process supervisor. Supports `--max-lifetime` for timeout enforcement and `--grace-period` for graceful shutdown.
 
 If `--payload` is omitted or set to `self`, the launcher extracts the embedded payload from its own executable (the assembled binary created by `seal compile --launcher`).
 
@@ -260,6 +371,15 @@ AGENT_SEAL_MASTER_SECRET_HEX=... \
   --payload ./payload.asl \
   --user-fingerprint $FP \
   --fingerprint-mode session
+
+# Interactive mode with lifetime limit
+AGENT_SEAL_MASTER_SECRET_HEX=... \
+  seal launch \
+  --payload ./payload.asl \
+  --user-fingerprint $FP \
+  --mode interactive \
+  --max-lifetime 300 \
+  --grace-period 10
 ```
 
 **Decryption failure** means the runtime fingerprint, user fingerprint, or master secret does not match what was used at compile time. This is by design — the payload is bound to a specific environment.
@@ -377,6 +497,8 @@ curl http://127.0.0.1:9090/api/v1/jobs/job-.../results
 
 ### `seal proxy` — LLM access proxy
 
+> **Deprecated in v0.2**: `seal proxy` is retained as an optional development tool. Enterprise deployments should use BYOK/BYOE patterns (bring-your-own-key/endpoint) instead.
+
 Starts an LLM proxy that holds provider API keys server-side. Agents authenticate with virtual keys and never see real credentials. Supports OpenAI and Anthropic providers, SSE streaming, and per-key rate limiting.
 
 ```text
@@ -398,7 +520,7 @@ Options:
 | DELETE | `/admin/keys/{key_id}` | admin token | Revoke a virtual key |
 | GET | `/_test/authenticated` | virtual key | Test auth (returns 200 if valid) |
 
-**Admin auth** is via `Authorization: Bearer <AGENT_SEAL_ADMIN_TOKEN>`. Defaults to `dev-admin-token` if not set.
+**Admin auth** is via `Authorization: Bearer <AGENT_SEAL_ADMIN_TOKEN>`. The `AGENT_SEAL_ADMIN_TOKEN` environment variable is required.
 
 **Virtual key auth** is via `Authorization: Bearer as-...` (keys created via `/admin/keys`).
 
@@ -475,7 +597,7 @@ curl -X DELETE -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" http://127.0.0
 | Variable | Component | Description |
 |----------|-----------|-------------|
 | `AGENT_SEAL_MASTER_SECRET_HEX` | launch | 64-hex master secret for HKDF key derivation |
-| `AGENT_SEAL_ADMIN_TOKEN` | proxy | Bearer token for admin key management APIs |
+| `AGENT_SEAL_ADMIN_TOKEN` | proxy | Required bearer token for admin key management APIs (no default) |
 | `AGENT_SEAL_LAUNCHER_PATH` | compile | Path to launcher binary (alternative to `--launcher`) |
 | `AGENT_SEAL_LAUNCHER_SIZE` | launch | Launcher binary size (for self-extraction) |
 | `RUST_LOG` | all | Tracing level/filter (e.g. `debug`, `info`, `agent_seal=trace`) |
@@ -495,7 +617,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ```bash
 cargo nextest run --workspace
-cargo llvm-cov nextest --workspace --lcov --output-path lcov.info --fail-under-lines 90
+cargo llvm-cov nextest --workspace --ignore-filename-regex "main\.rs" --lcov --output-path lcov.info --fail-under-lines 90
 ```
 
 ### CI summary
