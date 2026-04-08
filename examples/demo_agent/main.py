@@ -6,22 +6,26 @@ import sys
 import json
 import urllib.request
 
-PROXY_URL = os.environ.get("AGENT_SEAL_PROXY_URL", "http://localhost:8080")
+API_KEY = os.environ.get("AGENT_SEAL_API_KEY", "")
+API_BASE = os.environ.get("AGENT_SEAL_API_BASE", "https://api.openai.com")
+MODEL = os.environ.get("AGENT_SEAL_MODEL", "gpt-4o-mini")
 
 
 def call_llm(prompt: str) -> str:
+    if not API_KEY:
+        return "No API key configured. Set AGENT_SEAL_API_KEY."
     req = urllib.request.Request(
-        f"{PROXY_URL}/v1/chat/completions",
+        f"{API_BASE}/v1/chat/completions",
         data=json.dumps(
             {
-                "model": "gpt-4o-mini",
+                "model": MODEL,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 100,
             }
         ).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.environ.get('AGENT_SEAL_API_KEY', '')}",
+            "Authorization": f"Bearer {API_KEY}",
         },
         method="POST",
     )
