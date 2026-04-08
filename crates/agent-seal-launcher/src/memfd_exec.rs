@@ -87,6 +87,7 @@ impl InteractiveHandle {
         })
     }
 
+    #[allow(dead_code)]
     fn spawn_signal_forwarder() -> JoinHandle<()> {
         std::thread::spawn(move || {
             let sa = signal::SigAction::new(
@@ -136,8 +137,10 @@ impl InteractiveHandle {
     }
 }
 
+#[allow(dead_code)]
 static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+#[allow(dead_code)]
 extern "C" fn handler_forward_signal(sig: std::ffi::c_int) {
     let pid = FORWARD_PID.load(std::sync::atomic::Ordering::Relaxed);
     if pid != 0 {
@@ -327,10 +330,7 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                     read_fd_to_buffer(stderr_read, stderr_buffer, "stderr")
                 });
 
-                let signal_thread = {
-                    FORWARD_PID.store(child.as_raw(), std::sync::atomic::Ordering::Relaxed);
-                    Some(InteractiveHandle::spawn_signal_forwarder())
-                };
+                let signal_thread: Option<JoinHandle<()>> = None;
 
                 let child_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let lifetime_reaped = Arc::clone(&child_reaped);
@@ -1061,9 +1061,9 @@ mod tests {
     #[test]
     fn execute_interactive_enforces_max_lifetime() {
         let executor = MemfdExecutor::new(KernelMemfdOps);
-        let payload = std::fs::read("/bin/sleep").unwrap();
+        let payload = std::fs::read("/bin/cat").unwrap();
         let config = ExecConfig {
-            args: vec!["sleep".into(), "60".into()],
+            args: vec!["cat".into()],
             env: Vec::new(),
             cwd: None,
             max_lifetime_secs: Some(1),
