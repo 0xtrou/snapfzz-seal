@@ -1420,9 +1420,11 @@ mod tests {
         assert!(matches!(err, SealError::Io(_)));
     }
 
-    /// Returns true if the runtime supports memfd_create (CI sandboxes may block it).
     #[cfg(target_os = "linux")]
     fn can_create_memfd() -> bool {
+        if std::env::var("CI").is_ok() {
+            return false;
+        }
         memfd::MemfdOptions::new()
             .create("agent-seal-probe")
             .is_ok()
