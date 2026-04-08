@@ -1,6 +1,7 @@
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -9,7 +10,7 @@ use agent_seal_core::{error::SealError, types::ExecutionResult};
 use nix::errno::Errno;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, fork, pipe};
+use nix::unistd::{ForkResult, Pid, fork, pipe};
 
 pub trait MemfdOps: Send + Sync {
     fn create_memfd(&self, name: &str) -> Result<OwnedFd, SealError>;
@@ -35,46 +36,123 @@ pub struct ExecConfig {
     pub cwd: Option<String>,
     pub max_lifetime_secs: Option<u64>,
     pub grace_period_secs: u64,
+    pub max_output_bytes: Option<usize>,
 }
 
 pub struct InteractiveHandle {
-    child_pid: nix::unistd::Pid,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-    stdout_thread: JoinHandle<Result<(), SealError>>,
-    stderr_thread: JoinHandle<Result<(), SealError>>,
+    pub child_pid: u32,
+    stdin_write: Option<OwnedFd>,
+    stdout_read: Option<OwnedFd>,
+    stderr_read: Option<OwnedFd>,
+    max_lifetime: Option<Duration>,
+    grace_period: Duration,
+    heartbeat_timeout: Duration,
+    max_output_bytes: usize,
+}
+
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const ENV_DENYLIST: &[&str] = &[
+    "AGENT_SEAL_MASTER_SECRET_HEX",
+    "AGENT_SEAL_LAUNCHER_SECRET_HEX",
+    "AGENT_SEAL_LAUNCHER_SIZE",
+    "AGENT_SEAL_PAYLOAD_SENTINEL",
+];
+
+enum RelayInput {
+    ParentStdin,
     #[allow(dead_code)]
-    signal_thread: Option<JoinHandle<()>>,
-    #[allow(dead_code)]
-    lifetime_thread: Option<JoinHandle<()>>,
-    child_reaped: Arc<std::sync::atomic::AtomicBool>,
+    Bytes(Vec<u8>),
 }
 
 impl InteractiveHandle {
+    pub fn relay(self) -> Result<ExecutionResult, SealError> {
+        self.relay_with_input(RelayInput::ParentStdin)
+    }
+
     pub fn wait(self) -> Result<ExecutionResult, SealError> {
-        self.stdout_thread
+        self.relay()
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn relay_test_input(self, input: &[u8]) -> Result<ExecutionResult, SealError> {
+        self.relay_with_input(RelayInput::Bytes(input.to_vec()))
+    }
+
+    fn relay_with_input(mut self, input: RelayInput) -> Result<ExecutionResult, SealError> {
+        let child_pid = self.pid()?;
+        let child_done = Arc::new(AtomicBool::new(false));
+        let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+        let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+        let last_stdout = Arc::new(Mutex::new(Instant::now()));
+        let max_output_bytes = self.max_output_bytes;
+
+        let signal_guard = install_signal_forwarding(child_pid)?;
+        let signal_thread =
+            spawn_signal_escalation_monitor(child_pid, self.grace_period, Arc::clone(&child_done));
+        let lifetime_thread = self.max_lifetime.map(|max_lifetime| {
+            spawn_lifetime_monitor(
+                child_pid,
+                max_lifetime,
+                self.grace_period,
+                Arc::clone(&child_done),
+            )
+        });
+        let heartbeat_thread = spawn_heartbeat_monitor(
+            self.heartbeat_timeout,
+            Arc::clone(&last_stdout),
+            Arc::clone(&child_done),
+            child_pid,
+        );
+
+        let stdin_write = take_handle_fd(&mut self.stdin_write, "child stdin pipe")?;
+        let stdout_read = take_handle_fd(&mut self.stdout_read, "child stdout pipe")?;
+        let stderr_read = take_handle_fd(&mut self.stderr_read, "child stderr pipe")?;
+
+        let stdin_done = Arc::clone(&child_done);
+        let stdin_thread = std::thread::spawn(move || relay_stdin(input, stdin_write, stdin_done));
+
+        let stdout_output = Arc::clone(&stdout_buffer);
+        let stdout_last = Arc::clone(&last_stdout);
+        let stdout_thread = std::thread::spawn(move || {
+            relay_output_stream(
+                stdout_read,
+                stdout_output,
+                true,
+                Some(stdout_last),
+                max_output_bytes,
+            )
+        });
+
+        let stderr_output = Arc::clone(&stderr_buffer);
+        let stderr_thread = std::thread::spawn(move || {
+            relay_output_stream(stderr_read, stderr_output, false, None, max_output_bytes)
+        });
+
+        let wait_status = wait_for_child_exit(child_pid)?;
+        child_done.store(true, Ordering::Release);
+
+        stdin_thread
             .join()
-            .map_err(|_| SealError::InvalidInput("stdout reader thread panicked".to_string()))??;
-        self.stderr_thread
+            .map_err(|_| SealError::InvalidInput("stdin relay thread panicked".to_string()))??;
+        stdout_thread
             .join()
-            .map_err(|_| SealError::InvalidInput("stderr reader thread panicked".to_string()))??;
+            .map_err(|_| SealError::InvalidInput("stdout relay thread panicked".to_string()))??;
+        stderr_thread
+            .join()
+            .map_err(|_| SealError::InvalidInput("stderr relay thread panicked".to_string()))??;
 
-        let wait_status = if self.child_reaped.load(std::sync::atomic::Ordering::Acquire) {
-            WaitStatus::Exited(self.child_pid, 128 + Signal::SIGTERM as i32)
-        } else {
-            waitpid(self.child_pid, None).map_err(|err| SealError::Io(std::io::Error::from(err)))?
-        };
+        let _ = signal_thread.join();
+        if let Some(lifetime_thread) = lifetime_thread {
+            let _ = lifetime_thread.join();
+        }
+        let _ = heartbeat_thread.join();
+        drop(signal_guard);
 
-        if let Some(signal_thread) = self.signal_thread {
-            let _ = signal_thread.join();
-        };
-
-        let stdout = self
-            .stdout
+        let stdout = stdout_buffer
             .lock()
             .map_err(|_| SealError::InvalidInput("stdout buffer mutex poisoned".to_string()))?;
-        let stderr = self
-            .stderr
+        let stderr = stderr_buffer
             .lock()
             .map_err(|_| SealError::InvalidInput("stderr buffer mutex poisoned".to_string()))?;
 
@@ -85,67 +163,146 @@ impl InteractiveHandle {
         })
     }
 
-    #[allow(dead_code)]
-    fn spawn_signal_forwarder() -> JoinHandle<()> {
-        std::thread::spawn(move || {
-            let sa = signal::SigAction::new(
-                signal::SigHandler::Handler(handler_forward_signal),
-                signal::SaFlags::SA_RESTART,
-                signal::SigSet::empty(),
-            );
-            let _ = unsafe { signal::sigaction(Signal::SIGTERM, &sa) };
-            let _ = unsafe { signal::sigaction(Signal::SIGINT, &sa) };
-            std::thread::sleep(Duration::from_secs(86400));
-        })
-    }
-
-    fn spawn_lifetime_monitor(
-        child_pid: nix::unistd::Pid,
-        max_lifetime: Duration,
-        grace_period: Duration,
-        child_reaped: Arc<std::sync::atomic::AtomicBool>,
-    ) -> JoinHandle<()> {
-        std::thread::spawn(move || {
-            std::thread::sleep(max_lifetime);
-            tracing::warn!(
-                "agent exceeded max lifetime ({:?}), sending SIGTERM",
-                max_lifetime
-            );
-            let _ = signal::kill(child_pid, Signal::SIGTERM);
-
-            let deadline = Instant::now() + grace_period;
-            loop {
-                match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => {
-                        child_reaped.store(true, std::sync::atomic::Ordering::Release);
-                        break;
-                    }
-                    Ok(_) => {
-                        if Instant::now() >= deadline {
-                            tracing::warn!("grace period expired, sending SIGKILL");
-                            let _ = signal::kill(child_pid, Signal::SIGKILL);
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(_) => break,
-                }
-            }
-        })
+    fn pid(&self) -> Result<Pid, SealError> {
+        let raw = i32::try_from(self.child_pid)
+            .map_err(|_| SealError::InvalidInput("child pid out of range".to_string()))?;
+        Ok(Pid::from_raw(raw))
     }
 }
 
-#[allow(dead_code)]
-static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+struct SignalForwardGuard {
+    old_sigterm: signal::SigAction,
+    old_sigint: signal::SigAction,
+    previous_pid: i32,
+}
 
-#[allow(dead_code)]
-extern "C" fn handler_forward_signal(sig: std::ffi::c_int) {
-    let pid = FORWARD_PID.load(std::sync::atomic::Ordering::Relaxed);
-    if pid != 0 {
-        unsafe {
-            nix::libc::kill(pid, sig);
-        }
+impl Drop for SignalForwardGuard {
+    fn drop(&mut self) {
+        FORWARD_PID.store(self.previous_pid, Ordering::Release);
+        SIGNAL_FORWARD_TRIGGERED.store(false, Ordering::Release);
+        let _ = unsafe { signal::sigaction(Signal::SIGTERM, &self.old_sigterm) };
+        let _ = unsafe { signal::sigaction(Signal::SIGINT, &self.old_sigint) };
     }
+}
+
+static FORWARD_PID: AtomicI32 = AtomicI32::new(0);
+static SIGNAL_FORWARD_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handler_forward_signal(_sig: std::ffi::c_int) {
+    let pid = FORWARD_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        unsafe {
+            nix::libc::kill(pid, nix::libc::SIGTERM);
+        }
+        SIGNAL_FORWARD_TRIGGERED.store(true, Ordering::Release);
+    }
+}
+
+fn install_signal_forwarding(child_pid: Pid) -> Result<SignalForwardGuard, SealError> {
+    let action = signal::SigAction::new(
+        signal::SigHandler::Handler(handler_forward_signal),
+        signal::SaFlags::SA_RESTART,
+        signal::SigSet::empty(),
+    );
+
+    let old_sigterm =
+        unsafe { signal::sigaction(Signal::SIGTERM, &action) }.map_err(nix_error_to_seal)?;
+
+    let old_sigint = match unsafe { signal::sigaction(Signal::SIGINT, &action) } {
+        Ok(old) => old,
+        Err(err) => {
+            let _ = unsafe { signal::sigaction(Signal::SIGTERM, &old_sigterm) };
+            return Err(nix_error_to_seal(err));
+        }
+    };
+
+    let previous_pid = FORWARD_PID.swap(child_pid.as_raw(), Ordering::AcqRel);
+    SIGNAL_FORWARD_TRIGGERED.store(false, Ordering::Release);
+
+    Ok(SignalForwardGuard {
+        old_sigterm,
+        old_sigint,
+        previous_pid,
+    })
+}
+
+fn spawn_signal_escalation_monitor(
+    child_pid: Pid,
+    grace_period: Duration,
+    child_done: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !child_done.load(Ordering::Acquire) {
+            if SIGNAL_FORWARD_TRIGGERED.swap(false, Ordering::AcqRel) {
+                std::thread::sleep(grace_period);
+                if !child_done.load(Ordering::Acquire) {
+                    let _ = signal::kill(child_pid, Signal::SIGKILL);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    })
+}
+
+fn spawn_lifetime_monitor(
+    child_pid: Pid,
+    max_lifetime: Duration,
+    grace_period: Duration,
+    child_done: Arc<AtomicBool>,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        std::thread::sleep(max_lifetime);
+        if child_done.load(Ordering::Acquire) {
+            return;
+        }
+
+        tracing::warn!(
+            "agent exceeded max lifetime ({:?}), sending SIGTERM to pid {}",
+            max_lifetime,
+            child_pid
+        );
+        let _ = signal::kill(child_pid, Signal::SIGTERM);
+
+        std::thread::sleep(grace_period);
+        if !child_done.load(Ordering::Acquire) {
+            tracing::warn!(
+                "grace period expired ({}s), sending SIGKILL to pid {}",
+                grace_period.as_secs(),
+                child_pid
+            );
+            let _ = signal::kill(child_pid, Signal::SIGKILL);
+        }
+    })
+}
+
+fn spawn_heartbeat_monitor(
+    timeout: Duration,
+    last_stdout: Arc<Mutex<Instant>>,
+    child_done: Arc<AtomicBool>,
+    child_pid: Pid,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !child_done.load(Ordering::Acquire) {
+            std::thread::sleep(timeout);
+            if child_done.load(Ordering::Acquire) {
+                break;
+            }
+
+            let elapsed = match last_stdout.lock() {
+                Ok(instant) => instant.elapsed(),
+                Err(_) => break,
+            };
+
+            if elapsed >= timeout {
+                tracing::warn!(
+                    "interactive heartbeat timeout: no stdout from pid {} for {:?}",
+                    child_pid,
+                    elapsed
+                );
+            }
+        }
+    })
 }
 
 impl<Ops: MemfdOps> MemfdExecutor<Ops> {
@@ -163,15 +320,7 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
         let (stderr_read, stderr_write) =
             pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
 
-        let fork_result = unsafe { fork() }.map_err(|err| match err {
-            Errno::EAGAIN => {
-                SealError::InvalidInput("fork failed: EAGAIN (process limit reached)".to_string())
-            }
-            Errno::ENOMEM => {
-                SealError::InvalidInput("fork failed: ENOMEM (out of memory)".to_string())
-            }
-            other => SealError::Io(std::io::Error::from(other)),
-        })?;
+        let fork_result = unsafe { fork() }.map_err(fork_error_to_seal)?;
 
         match fork_result {
             ForkResult::Child => {
@@ -190,37 +339,19 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                 drop(stdout_write);
                 drop(stderr_write);
 
-                if let Some(cwd) = &config.cwd
-                    && let Err(err) = std::env::set_current_dir(cwd)
-                {
-                    eprintln!("failed to set cwd: {err}");
-                    unsafe {
-                        nix::libc::_exit(127);
-                    }
-                }
-
-                let exec_result = (|| -> Result<(), SealError> {
-                    let fd = self.ops.create_memfd("agent-seal-payload")?;
-                    for chunk in binary_data.chunks(65_536) {
-                        self.ops.write_chunk(&fd, chunk)?;
-                    }
-                    self.ops.seal_memfd(&fd)?;
-                    let argv = build_argv(config)?;
-                    let envp = build_envp(config)?;
-                    self.ops.exec_memfd(&fd, &argv, &envp)
-                })();
-
-                if let Err(err) = exec_result {
-                    eprintln!("memfd execution failed: {err}");
-                }
-                std::process::exit(127);
+                run_memfd_child(&self.ops, binary_data, config);
             }
             ForkResult::Parent { child } => {
                 drop(stdout_write);
                 drop(stderr_write);
 
-                let stdout_handle = std::thread::spawn(move || read_fd_to_string(stdout_read));
-                let stderr_handle = std::thread::spawn(move || read_fd_to_string(stderr_read));
+                let max_output_bytes = max_output_bytes(config);
+                let stdout_handle = std::thread::spawn(move || {
+                    read_fd_to_string_with_limit(stdout_read, max_output_bytes)
+                });
+                let stderr_handle = std::thread::spawn(move || {
+                    read_fd_to_string_with_limit(stderr_read, max_output_bytes)
+                });
 
                 let stdout = stdout_handle.join().map_err(|_| {
                     SealError::InvalidInput("stdout reader thread panicked".to_string())
@@ -229,8 +360,7 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                     SealError::InvalidInput("stderr reader thread panicked".to_string())
                 })??;
 
-                let wait_status =
-                    waitpid(child, None).map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+                let wait_status = wait_for_child_exit(child)?;
 
                 Ok(ExecutionResult {
                     exit_code: extract_exit_code(wait_status),
@@ -253,15 +383,7 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
         let (stderr_read, stderr_write) =
             pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
 
-        let fork_result = unsafe { fork() }.map_err(|err| match err {
-            Errno::EAGAIN => {
-                SealError::InvalidInput("fork failed: EAGAIN (process limit reached)".to_string())
-            }
-            Errno::ENOMEM => {
-                SealError::InvalidInput("fork failed: ENOMEM (out of memory)".to_string())
-            }
-            other => SealError::Io(std::io::Error::from(other)),
-        })?;
+        let fork_result = unsafe { fork() }.map_err(fork_error_to_seal)?;
 
         match fork_result {
             ForkResult::Child => {
@@ -285,72 +407,22 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                 drop(stdout_write);
                 drop(stderr_write);
 
-                if let Some(cwd) = &config.cwd
-                    && let Err(err) = std::env::set_current_dir(cwd)
-                {
-                    eprintln!("failed to set cwd: {err}");
-                    unsafe {
-                        nix::libc::_exit(127);
-                    }
-                }
-
-                let exec_result = (|| -> Result<(), SealError> {
-                    let fd = self.ops.create_memfd("agent-seal-payload")?;
-                    for chunk in binary_data.chunks(65_536) {
-                        self.ops.write_chunk(&fd, chunk)?;
-                    }
-                    self.ops.seal_memfd(&fd)?;
-                    let argv = build_argv(config)?;
-                    let envp = build_envp(config)?;
-                    self.ops.exec_memfd(&fd, &argv, &envp)
-                })();
-
-                if let Err(err) = exec_result {
-                    eprintln!("memfd execution failed: {err}");
-                }
-                std::process::exit(127);
+                run_memfd_child(&self.ops, binary_data, config);
             }
             ForkResult::Parent { child } => {
                 drop(stdin_read);
-                drop(stdin_write);
                 drop(stdout_write);
                 drop(stderr_write);
 
-                let stdout = Arc::new(Mutex::new(Vec::new()));
-                let stderr = Arc::new(Mutex::new(Vec::new()));
-                let stdout_buffer = Arc::clone(&stdout);
-                let stderr_buffer = Arc::clone(&stderr);
-
-                let stdout_thread = std::thread::spawn(move || {
-                    read_fd_to_buffer(stdout_read, stdout_buffer, "stdout")
-                });
-                let stderr_thread = std::thread::spawn(move || {
-                    read_fd_to_buffer(stderr_read, stderr_buffer, "stderr")
-                });
-
-                let signal_thread: Option<JoinHandle<()>> = None;
-
-                let child_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let lifetime_reaped = Arc::clone(&child_reaped);
-
-                let lifetime_thread = config.max_lifetime_secs.map(|secs| {
-                    InteractiveHandle::spawn_lifetime_monitor(
-                        child,
-                        Duration::from_secs(secs),
-                        Duration::from_secs(config.grace_period_secs),
-                        lifetime_reaped,
-                    )
-                });
-
                 Ok(InteractiveHandle {
-                    child_pid: child,
-                    stdout,
-                    stderr,
-                    stdout_thread,
-                    stderr_thread,
-                    signal_thread,
-                    lifetime_thread,
-                    child_reaped,
+                    child_pid: child.as_raw() as u32,
+                    stdin_write: Some(stdin_write),
+                    stdout_read: Some(stdout_read),
+                    stderr_read: Some(stderr_read),
+                    max_lifetime: config.max_lifetime_secs.map(Duration::from_secs),
+                    grace_period: Duration::from_secs(config.grace_period_secs),
+                    heartbeat_timeout: heartbeat_timeout_from_env(),
+                    max_output_bytes: max_output_bytes(config),
                 })
             }
         }
@@ -369,12 +441,10 @@ impl MemfdOps for KernelMemfdOps {
     }
 
     fn write_chunk(&self, fd: &OwnedFd, data: &[u8]) -> Result<(), SealError> {
-        use std::io::Write;
         use std::os::fd::FromRawFd;
 
         let dup_fd = nix::unistd::dup(fd.as_raw_fd())
             .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
-        // SAFETY: dup() returns a valid, owned raw fd
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         if data.is_empty() {
             return Ok(());
@@ -389,7 +459,6 @@ impl MemfdOps for KernelMemfdOps {
 
         let dup_fd = nix::unistd::dup(fd.as_raw_fd())
             .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
-        // SAFETY: dup() returns a valid, owned raw fd
         let file = unsafe { std::fs::File::from_raw_fd(dup_fd) };
         let memfd = memfd::Memfd::try_from_file(file)
             .map_err(|_| SealError::InvalidInput("fd is not a memfd".to_string()))?;
@@ -465,6 +534,68 @@ impl MemfdOps for KernelMemfdOps {
     }
 }
 
+fn fork_error_to_seal(err: Errno) -> SealError {
+    match err {
+        Errno::EAGAIN => {
+            SealError::InvalidInput("fork failed: EAGAIN (process limit reached)".to_string())
+        }
+        Errno::ENOMEM => SealError::InvalidInput("fork failed: ENOMEM (out of memory)".to_string()),
+        other => SealError::Io(std::io::Error::from(other)),
+    }
+}
+
+fn run_memfd_child<Ops: MemfdOps>(ops: &Ops, binary_data: &[u8], config: &ExecConfig) -> ! {
+    if let Some(cwd) = &config.cwd
+        && let Err(err) = std::env::set_current_dir(cwd)
+    {
+        eprintln!("failed to set cwd: {err}");
+        unsafe {
+            nix::libc::_exit(127);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { nix::libc::prctl(nix::libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        if rc != 0 {
+            eprintln!(
+                "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { nix::libc::_exit(127) };
+        }
+
+        if let Err(err) = crate::seccomp::apply_seccomp_filter() {
+            eprintln!("seccomp filter failed: {err}");
+            unsafe { nix::libc::_exit(127) };
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = crate::seccomp::apply_seccomp_filter();
+    }
+
+    let exec_result = (|| -> Result<(), SealError> {
+        let fd = ops.create_memfd("agent-seal-payload")?;
+        for chunk in binary_data.chunks(65_536) {
+            ops.write_chunk(&fd, chunk)?;
+        }
+        ops.seal_memfd(&fd)?;
+        let argv = build_argv(config)?;
+        let envp = build_envp(config)?;
+        ops.exec_memfd(&fd, &argv, &envp)
+    })();
+
+    if let Err(err) = exec_result {
+        eprintln!("memfd execution failed: {err}");
+    }
+
+    unsafe {
+        nix::libc::_exit(127);
+    }
+}
+
 fn build_argv(config: &ExecConfig) -> Result<Vec<CString>, SealError> {
     let args = if config.args.is_empty() {
         vec!["agent-seal-payload".to_string()]
@@ -482,9 +613,9 @@ fn build_argv(config: &ExecConfig) -> Result<Vec<CString>, SealError> {
 
 fn build_envp(config: &ExecConfig) -> Result<Vec<CString>, SealError> {
     let pairs: Vec<(String, String)> = if config.env.is_empty() {
-        std::env::vars().collect()
+        scrub_env(std::env::vars().collect())
     } else {
-        config.env.clone()
+        scrub_env(config.env.clone())
     };
 
     pairs
@@ -496,26 +627,200 @@ fn build_envp(config: &ExecConfig) -> Result<Vec<CString>, SealError> {
         .collect()
 }
 
-fn read_fd_to_string(fd: OwnedFd) -> Result<String, SealError> {
-    let mut file = std::fs::File::from(fd);
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    Ok(String::from_utf8_lossy(&buffer).into_owned())
+fn scrub_env(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    pairs
+        .into_iter()
+        .filter(|(k, _)| {
+            !ENV_DENYLIST
+                .iter()
+                .any(|blocked| k.eq_ignore_ascii_case(blocked))
+        })
+        .collect()
 }
 
-fn read_fd_to_buffer(
+fn take_handle_fd(slot: &mut Option<OwnedFd>, name: &str) -> Result<OwnedFd, SealError> {
+    slot.take()
+        .ok_or_else(|| SealError::InvalidInput(format!("missing {name}")))
+}
+
+fn relay_stdin(
+    input: RelayInput,
+    stdin_write: OwnedFd,
+    child_done: Arc<AtomicBool>,
+) -> Result<(), SealError> {
+    let mut child_stdin = std::fs::File::from(stdin_write);
+
+    match input {
+        RelayInput::Bytes(bytes) => {
+            write_all_ignore_broken_pipe(&mut child_stdin, &bytes)?;
+            Ok(())
+        }
+        RelayInput::ParentStdin => {
+            let stdin = std::io::stdin();
+            let mut stdin_lock = stdin.lock();
+            let mut buffer = [0_u8; 8192];
+
+            loop {
+                if child_done.load(Ordering::Acquire) {
+                    break;
+                }
+
+                if !poll_readable(nix::libc::STDIN_FILENO, Duration::from_millis(100))? {
+                    continue;
+                }
+
+                match stdin_lock.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        write_all_ignore_broken_pipe(&mut child_stdin, &buffer[..n])?;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(SealError::Io(err)),
+                }
+            }
+
+            Ok(())
+        }
+    }
+}
+
+fn relay_output_stream(
     fd: OwnedFd,
     buffer: Arc<Mutex<Vec<u8>>>,
-    stream_name: &'static str,
+    is_stdout: bool,
+    last_stdout: Option<Arc<Mutex<Instant>>>,
+    max_output_bytes: usize,
 ) -> Result<(), SealError> {
-    let mut file = std::fs::File::from(fd);
-    let mut local = Vec::new();
-    file.read_to_end(&mut local)?;
-    *buffer
-        .lock()
-        .map_err(|_| SealError::InvalidInput(format!("{stream_name} buffer mutex poisoned")))? =
-        local;
+    let file = std::fs::File::from(fd);
+    let mut reader = BufReader::new(file);
+
+    loop {
+        let mut line = Vec::new();
+        let read = reader.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+
+        if let Some(last_stdout) = &last_stdout {
+            let mut last = last_stdout.lock().map_err(|_| {
+                SealError::InvalidInput("stdout heartbeat mutex poisoned".to_string())
+            })?;
+            *last = Instant::now();
+        }
+
+        {
+            let mut captured = buffer
+                .lock()
+                .map_err(|_| SealError::InvalidInput("output buffer mutex poisoned".to_string()))?;
+            if captured.len() + line.len() <= max_output_bytes {
+                captured.extend_from_slice(&line);
+            } else {
+                break;
+            }
+        }
+
+        if is_stdout {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            stdout.write_all(&line)?;
+            stdout.flush()?;
+        } else {
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            stderr.write_all(&line)?;
+            stderr.flush()?;
+        }
+    }
+
     Ok(())
+}
+
+fn write_all_ignore_broken_pipe<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<(), SealError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+
+    match writer.write_all(bytes) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(SealError::Io(err)),
+    }
+}
+
+fn poll_readable(fd: i32, timeout: Duration) -> Result<bool, SealError> {
+    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut pollfd = nix::libc::pollfd {
+        fd,
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+
+    loop {
+        let rc = unsafe { nix::libc::poll(&mut pollfd, 1, timeout_ms) };
+        if rc > 0 {
+            return Ok((pollfd.revents & (nix::libc::POLLIN | nix::libc::POLLHUP)) != 0);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(SealError::Io(err));
+    }
+}
+
+fn wait_for_child_exit(child_pid: Pid) -> Result<WaitStatus, SealError> {
+    loop {
+        match waitpid(child_pid, None) {
+            Ok(status) => return Ok(status),
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(SealError::Io(std::io::Error::from(err))),
+        }
+    }
+}
+
+fn heartbeat_timeout_from_env() -> Duration {
+    std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(30))
+}
+
+fn max_output_bytes(config: &ExecConfig) -> usize {
+    config.max_output_bytes.unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+}
+
+fn nix_error_to_seal(err: Errno) -> SealError {
+    SealError::Io(std::io::Error::from(err))
+}
+
+fn read_fd_to_string_with_limit(fd: OwnedFd, max_bytes: usize) -> Result<String, SealError> {
+    let mut file = std::fs::File::from(fd);
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(buffer.len());
+        if remaining == 0 {
+            break;
+        }
+        let to_copy = remaining.min(read);
+        buffer.extend_from_slice(&chunk[..to_copy]);
+        if to_copy < read {
+            break;
+        }
+    }
+
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 fn extract_exit_code(status: WaitStatus) -> i32 {
@@ -533,8 +838,6 @@ mod tests {
     use super::*;
 
     use std::fs::{self, OpenOptions};
-    use std::io::{Read, Write};
-
     use std::os::fd::{AsFd, AsRawFd};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -647,6 +950,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -673,6 +977,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -696,6 +1001,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let argv = build_argv(&config).unwrap();
@@ -711,6 +1017,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let argv = build_argv(&config).unwrap();
@@ -729,25 +1036,96 @@ mod tests {
     }
 
     #[test]
-    fn build_envp_uses_process_env_when_empty() {
+    fn build_envp_strips_master_secret_from_process_env() {
+        let previous = std::env::var("AGENT_SEAL_MASTER_SECRET_HEX").ok();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "super-secret");
+        }
+
         let config = ExecConfig {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let envp = build_envp(&config).unwrap();
-        assert!(!envp.is_empty());
+        let flattened: Vec<Vec<u8>> = envp
+            .iter()
+            .map(|entry| entry.as_c_str().to_bytes().to_vec())
+            .collect();
         assert!(
-            envp.iter()
-                .all(|entry| entry.as_c_str().to_bytes().contains(&b'='))
+            !flattened
+                .iter()
+                .any(|entry| entry.starts_with(b"AGENT_SEAL_MASTER_SECRET_HEX="))
         );
+
+        restore_env_var("AGENT_SEAL_MASTER_SECRET_HEX", previous.as_deref());
     }
 
     #[test]
-    fn build_envp_uses_custom_env() {
+    fn build_envp_strips_launcher_size_from_process_env() {
+        let previous = std::env::var("AGENT_SEAL_LAUNCHER_SIZE").ok();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_LAUNCHER_SIZE", "12345");
+        }
+
+        let config = ExecConfig {
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let envp = build_envp(&config).unwrap();
+        let flattened: Vec<Vec<u8>> = envp
+            .iter()
+            .map(|entry| entry.as_c_str().to_bytes().to_vec())
+            .collect();
+        assert!(
+            !flattened
+                .iter()
+                .any(|entry| entry.starts_with(b"AGENT_SEAL_LAUNCHER_SIZE="))
+        );
+
+        restore_env_var("AGENT_SEAL_LAUNCHER_SIZE", previous.as_deref());
+    }
+
+    #[test]
+    fn build_envp_strips_secret_from_explicit_env() {
+        let config = ExecConfig {
+            args: Vec::new(),
+            env: vec![
+                (
+                    "AGENT_SEAL_MASTER_SECRET_HEX".to_string(),
+                    "super-secret".to_string(),
+                ),
+                (
+                    "AGENT_SEAL_LAUNCHER_SECRET_HEX".to_string(),
+                    "launcher-secret".to_string(),
+                ),
+                ("SAFE".to_string(), "1".to_string()),
+            ],
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let envp = build_envp(&config).unwrap();
+        let as_bytes: Vec<Vec<u8>> = envp
+            .iter()
+            .map(|entry| entry.as_c_str().to_bytes().to_vec())
+            .collect();
+        assert_eq!(as_bytes, vec![b"SAFE=1".to_vec()]);
+    }
+
+    #[test]
+    fn build_envp_preserves_safe_env_vars() {
         let config = ExecConfig {
             args: Vec::new(),
             env: vec![
@@ -757,6 +1135,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let envp = build_envp(&config).unwrap();
@@ -768,14 +1147,58 @@ mod tests {
     }
 
     #[test]
+    fn scrub_env_filters_all_denylisted_keys() {
+        let scrubbed = scrub_env(vec![
+            (
+                "AGENT_SEAL_MASTER_SECRET_HEX".to_string(),
+                "master".to_string(),
+            ),
+            (
+                "AGENT_SEAL_LAUNCHER_SECRET_HEX".to_string(),
+                "launcher".to_string(),
+            ),
+            ("AGENT_SEAL_LAUNCHER_SIZE".to_string(), "42".to_string()),
+            (
+                "AGENT_SEAL_PAYLOAD_SENTINEL".to_string(),
+                "sentinel".to_string(),
+            ),
+            ("SAFE".to_string(), "ok".to_string()),
+        ]);
+
+        assert_eq!(scrubbed, vec![("SAFE".to_string(), "ok".to_string())]);
+    }
+
+    #[test]
     fn read_fd_to_string_reads_pipe_content() {
         let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
         let mut writer = std::fs::File::from(write_fd);
         writer.write_all(b"hello-from-pipe").unwrap();
         drop(writer);
 
-        let text = read_fd_to_string(read_fd).unwrap();
+        let text = read_fd_to_string_with_limit(read_fd, usize::MAX).unwrap();
         assert_eq!(text, "hello-from-pipe");
+    }
+
+    #[test]
+    fn read_fd_to_string_with_limit_enforces_max_bytes() {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(b"0123456789").unwrap();
+        drop(writer);
+
+        let text = read_fd_to_string_with_limit(read_fd, 4).unwrap();
+        assert_eq!(text, "0123");
+    }
+
+    #[test]
+    fn read_fd_to_string_with_limit_allows_within_limit() {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        let mut writer = std::fs::File::from(write_fd);
+        writer.write_all(b"hello").unwrap();
+        drop(writer);
+
+        let text = read_fd_to_string_with_limit(read_fd, 10).unwrap();
+        assert_eq!(text, "hello");
     }
 
     #[test]
@@ -793,6 +1216,7 @@ mod tests {
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -836,6 +1260,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let result = executor.execute(b"payload", &config).unwrap();
@@ -852,6 +1277,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -871,10 +1297,23 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let err = build_argv(&config).expect_err("NUL argument must fail");
         assert!(matches!(err, SealError::InvalidInput(_)));
+    }
+
+    fn restore_env_var(name: &str, previous: Option<&str>) {
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
     }
 
     #[test]
@@ -888,6 +1327,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
 
         let err = build_envp(&config).expect_err("NUL env value must fail");
@@ -901,15 +1341,12 @@ mod tests {
         writer.write_all(&[0xf0, 0x28, 0x8c, 0x28]).unwrap();
         drop(writer);
 
-        let text = read_fd_to_string(read_fd).unwrap();
+        let text = read_fd_to_string_with_limit(read_fd, usize::MAX).unwrap();
         assert!(text.contains('\u{fffd}'));
     }
 
     #[test]
     fn extract_exit_code_covers_all_match_arms() {
-        use nix::sys::signal::Signal;
-        use nix::unistd::Pid;
-
         let pid = Pid::from_raw(1234);
 
         assert_eq!(extract_exit_code(WaitStatus::Exited(pid, 7)), 7);
@@ -923,6 +1360,20 @@ mod tests {
         );
         assert_eq!(extract_exit_code(WaitStatus::Continued(pid)), 0);
         assert_eq!(extract_exit_code(WaitStatus::StillAlive), 1);
+    }
+
+    #[test]
+    fn heartbeat_timeout_uses_default_when_env_missing() {
+        let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
+        unsafe {
+            std::env::remove_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS");
+        }
+        assert_eq!(heartbeat_timeout_from_env(), Duration::from_secs(30));
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", previous);
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -973,29 +1424,144 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn execute_interactive_runs_linux_payloads() {
+    fn execute_interactive_creates_child_process() {
         let executor = MemfdExecutor::new(KernelMemfdOps);
-        let cases = [
-            ("/bin/true", vec!["true"], 0, ""),
-            ("/bin/false", vec!["false"], 1, ""),
-            ("/bin/sh", vec!["sh", "-c", "echo hi"], 0, "hi\n"),
-        ];
+        let payload = std::fs::read("/bin/true").unwrap();
+        let config = ExecConfig {
+            args: vec!["true".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
 
-        for (path, args, expected_exit, expected_stdout) in cases {
-            let payload = std::fs::read(path).unwrap();
-            let config = ExecConfig {
-                args: args.into_iter().map(str::to_string).collect(),
-                env: Vec::new(),
-                cwd: None,
-                max_lifetime_secs: None,
-                grace_period_secs: 30,
-            };
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        assert!(handle.child_pid > 0);
+        let result = handle.relay().unwrap();
+        assert_eq!(result.exit_code, 0);
+    }
 
-            let handle = executor.execute_interactive(&payload, &config).unwrap();
-            let result = handle.wait().unwrap();
-            assert_eq!(result.exit_code, expected_exit);
-            assert_eq!(result.stdout, expected_stdout);
-        }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_relays_output() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/echo").unwrap();
+        let config = ExecConfig {
+            args: vec!["echo".into(), "hello".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.relay().unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello\n");
+        assert!(result.stderr.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_captures_stderr() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/sh").unwrap();
+        let config = ExecConfig {
+            args: vec!["sh".into(), "-c".into(), "printf 'oops\\n' >&2".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.relay().unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stderr, "oops\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_returns_exit_code() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/false").unwrap();
+        let config = ExecConfig {
+            args: vec!["false".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.relay().unwrap();
+        assert_eq!(result.exit_code, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_accepts_stdin() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/cat").unwrap();
+        let config = ExecConfig {
+            args: vec!["cat".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.relay_test_input(b"hello cat\n").unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "hello cat\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_enforces_max_lifetime() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/sleep").unwrap();
+        let config = ExecConfig {
+            args: vec!["sleep".into(), "30".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: Some(1),
+            grace_period_secs: 1,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let start = Instant::now();
+        let result = handle.relay().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(10));
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_allows_completion_within_lifetime() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/true").unwrap();
+        let config = ExecConfig {
+            args: vec!["true".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: Some(300),
+            grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.wait().unwrap();
+        assert_eq!(result.exit_code, 0);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1037,6 +1603,7 @@ mod tests {
             cwd: None,
             max_lifetime_secs: None,
             grace_period_secs: 30,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
         assert!(config.max_lifetime_secs.is_none());
         assert_eq!(config.grace_period_secs, 30);
@@ -1050,52 +1617,9 @@ mod tests {
             cwd: None,
             max_lifetime_secs: Some(3600),
             grace_period_secs: 60,
+            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
         };
         assert_eq!(config.max_lifetime_secs, Some(3600));
         assert_eq!(config.grace_period_secs, 60);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn execute_interactive_enforces_max_lifetime() {
-        let executor = MemfdExecutor::new(KernelMemfdOps);
-        let payload = std::fs::read("/bin/sleep").unwrap();
-        let config = ExecConfig {
-            args: vec!["sleep".into(), "30".into()],
-            env: Vec::new(),
-            cwd: None,
-            max_lifetime_secs: Some(1),
-            grace_period_secs: 1,
-        };
-
-        let handle = executor.execute_interactive(&payload, &config).unwrap();
-        let start = std::time::Instant::now();
-        let result = handle.wait().unwrap();
-        let elapsed = start.elapsed();
-
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "should have been killed by lifetime, not waited full 30s: {:?}",
-            elapsed
-        );
-        assert_ne!(result.exit_code, 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn execute_interactive_allows_completion_within_lifetime() {
-        let executor = MemfdExecutor::new(KernelMemfdOps);
-        let payload = std::fs::read("/bin/true").unwrap();
-        let config = ExecConfig {
-            args: vec!["true".into()],
-            env: Vec::new(),
-            cwd: None,
-            max_lifetime_secs: Some(300),
-            grace_period_secs: 30,
-        };
-
-        let handle = executor.execute_interactive(&payload, &config).unwrap();
-        let result = handle.wait().unwrap();
-        assert_eq!(result.exit_code, 0);
     }
 }

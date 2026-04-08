@@ -40,16 +40,16 @@ impl FingerprintCollector {
     pub fn new() -> Self {
         Self {
             app_key: None,
-            include_mac: false,
-            include_dmi: false,
+            include_mac: true,
+            include_dmi: true,
         }
     }
 
     pub fn with_app_key(key: [u8; 32]) -> Self {
         Self {
             app_key: Some(key),
-            include_mac: false,
-            include_dmi: false,
+            include_mac: true,
+            include_dmi: true,
         }
     }
 
@@ -122,6 +122,9 @@ impl FingerprintCollector {
                 Stability::SemiStable,
             );
         }
+
+        collect_mac_address(&mut stable, self.include_mac);
+        collect_dmi_product_uuid(&mut stable, self.include_dmi);
 
         if let Some(cmdline) = read_trimmed_text("/proc/cmdline") {
             let filtered = filter_cmdline_allowlist(&cmdline);
@@ -197,7 +200,7 @@ fn push_source(
     });
 }
 
-fn read_trimmed_text(path: &str) -> Option<String> {
+fn read_trimmed_text(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path)
         .ok()
         .map(|value| value.trim().to_string())
@@ -295,6 +298,64 @@ fn filter_cmdline_allowlist(cmdline: &str) -> String {
     kept.join(" ")
 }
 
+fn collect_mac_address(sources: &mut Vec<SourceValue>, include_mac: bool) {
+    if !include_mac {
+        return;
+    }
+
+    let net_dir = match fs::read_dir("/sys/class/net") {
+        Ok(dir) => dir,
+        Err(_) => return,
+    };
+
+    let mut mac_bytes = None;
+    for entry in net_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "lo" {
+            continue;
+        }
+        let addr_path = entry.path().join("address");
+        if let Ok(content) = fs::read_to_string(&addr_path) {
+            let trimmed = content.trim();
+            if let Ok(parsed) = parse_mac_address(trimmed) {
+                mac_bytes = Some(parsed);
+                break;
+            }
+        }
+    }
+
+    if let Some(bytes) = mac_bytes {
+        push_source(sources, "linux.mac_address", bytes, 85, Stability::Stable);
+    }
+}
+
+fn parse_mac_address(s: &str) -> Result<Vec<u8>, ()> {
+    let hex_str: String = s.chars().filter(|c| *c != ':').collect();
+    hex::decode(&hex_str).map_err(|_| ())
+}
+
+fn collect_dmi_product_uuid(sources: &mut Vec<SourceValue>, include_dmi: bool) {
+    if !include_dmi {
+        return;
+    }
+
+    let path = Path::new("/sys/class/dmi/id/product_uuid");
+    if let Some(content) = read_trimmed_text(path) {
+        let normalized = content.trim().to_ascii_lowercase();
+        if !normalized.is_empty() && normalized != "not present" {
+            let digest = sha256(normalized.as_bytes());
+            push_source(
+                sources,
+                "linux.dmi_product_uuid_hmac",
+                digest,
+                88,
+                Stability::Stable,
+            );
+        }
+    }
+}
+
 fn collect_namespace_inode(
     target: &mut Vec<SourceValue>,
     id: &'static str,
@@ -372,9 +433,9 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::{
-        FingerprintCollector, extract_cgroup_path, filter_cmdline_allowlist, hmac_sha256,
-        is_container_id_segment, normalize_cgroup_path, parse_namespace_inode, read_trimmed_text,
-        sha256,
+        FingerprintCollector, collect_dmi_product_uuid, collect_mac_address, extract_cgroup_path,
+        filter_cmdline_allowlist, hmac_sha256, is_container_id_segment, normalize_cgroup_path,
+        parse_mac_address, parse_namespace_inode, read_trimmed_text, sha256,
     };
     use crate::model::{RuntimeKind, Stability};
 
@@ -409,11 +470,25 @@ mod tests {
     }
 
     #[test]
-    fn with_app_key_sets_key_and_keeps_optional_flags_disabled() {
+    fn collector_defaults_include_mac_and_dmi() {
+        let collector = FingerprintCollector::new();
+        assert!(collector.include_mac);
+        assert!(collector.include_dmi);
+    }
+
+    #[test]
+    fn collector_with_app_key_includes_mac_and_dmi() {
+        let collector = FingerprintCollector::with_app_key([0x42; 32]);
+        assert!(collector.include_mac);
+        assert!(collector.include_dmi);
+    }
+
+    #[test]
+    fn with_app_key_sets_key_and_keeps_optional_flags_enabled() {
         let collector = FingerprintCollector::with_app_key([0xAB; 32]);
         assert_eq!(collector.app_key, Some([0xAB; 32]));
-        assert!(!collector.include_mac);
-        assert!(!collector.include_dmi);
+        assert!(collector.include_mac);
+        assert!(collector.include_dmi);
     }
 
     #[test]
@@ -497,6 +572,37 @@ mod tests {
             "ROOT=/dev/sda1 quiet splash panic=1 custom=drop firecracker=1 rw",
         );
         assert_eq!(filtered, "root=/dev/sda1 quiet panic=1 firecracker=1 rw");
+    }
+
+    #[test]
+    fn parse_mac_address_parses_colon_format() {
+        let result = parse_mac_address("00:11:22:33:44:55").expect("valid mac should parse");
+        assert_eq!(result, vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    }
+
+    #[test]
+    fn parse_mac_address_rejects_invalid() {
+        assert!(parse_mac_address("zz:zz:zz:zz:zz:zz").is_err());
+    }
+
+    #[test]
+    fn collect_mac_address_skips_loopback() {
+        let mut sources = Vec::new();
+        collect_mac_address(&mut sources, true);
+    }
+
+    #[test]
+    fn collect_mac_address_skipped_when_disabled() {
+        let mut sources = Vec::new();
+        collect_mac_address(&mut sources, false);
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn collect_dmi_skipped_when_disabled() {
+        let mut sources = Vec::new();
+        collect_dmi_product_uuid(&mut sources, false);
+        assert!(sources.is_empty());
     }
 
     #[test]

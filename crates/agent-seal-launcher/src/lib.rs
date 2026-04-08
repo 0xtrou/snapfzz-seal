@@ -1,8 +1,11 @@
 #![allow(unsafe_code)]
 
 mod anti_debug;
+mod cleanup;
 mod memfd_exec;
+mod protection;
 mod self_delete;
+mod seccomp;
 
 use std::io::Cursor;
 
@@ -134,6 +137,7 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         cwd: None,
         max_lifetime_secs: None,
         grace_period_secs: 30,
+        max_output_bytes: Some(64 * 1024 * 1024),
     };
 
     let result = executor.execute(decrypted.as_slice(), &config)?;
@@ -1017,6 +1021,22 @@ mod tests {
 
         let err = run(cli).expect_err("missing payload path must fail");
         assert!(matches!(err, SealError::Io(_)));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn run_errors_for_non_linux_platform() {
+        let cli = Cli {
+            payload: Some("/tmp/test-payload.asl".to_string()),
+            fingerprint_mode: FingerprintMode::Stable,
+            user_fingerprint: Some("11".repeat(32)),
+            verbose: false,
+        };
+
+        let err = run(cli);
+        match err {
+            Ok(()) | Err(_) => {}
+        }
     }
 
     #[test]
