@@ -2,7 +2,7 @@ use crate::{
     constants::{CHUNK_SIZE, ENC_ALG_AES256_GCM, FMT_STREAM, MAGIC_BYTES, VERSION_V1},
     crypto::{decrypt_stream, encrypt_stream},
     error::SealError,
-    types::PayloadHeader,
+    types::{PayloadFooter, PayloadHeader},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -12,6 +12,7 @@ use subtle::ConstantTimeEq;
 type HmacSha256 = Hmac<Sha256>;
 
 const HEADER_SIZE: usize = 4 + 2 + 2 + 2 + 4 + 32;
+const FOOTER_SIZE: usize = 64;
 const NONCE_SIZE: usize = 7;
 
 pub fn pack_payload(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>, SealError> {
@@ -19,12 +20,6 @@ pub fn pack_payload(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>,
     plaintext.read_to_end(&mut plaintext_bytes)?;
 
     let encrypted_bytes = encrypt_stream(Cursor::new(&plaintext_bytes), key)?;
-
-    if encrypted_bytes.len() < NONCE_SIZE {
-        return Err(SealError::EncryptionFailed(
-            "encrypted payload missing stream nonce".to_string(),
-        ));
-    }
 
     let chunk_count = if plaintext_bytes.is_empty() {
         0
@@ -106,6 +101,32 @@ pub fn validate_payload_header(data: &[u8]) -> Result<PayloadHeader, SealError> 
     }
 
     parse_header(&data[..HEADER_SIZE])
+}
+
+pub fn write_footer(footer: &PayloadFooter) -> [u8; FOOTER_SIZE] {
+    let mut out = [0_u8; FOOTER_SIZE];
+    out[..32].copy_from_slice(&footer.original_hash);
+    out[32..].copy_from_slice(&footer.launcher_hash);
+    out
+}
+
+pub fn read_footer(data: &[u8]) -> Result<PayloadFooter, SealError> {
+    if data.len() != FOOTER_SIZE {
+        return Err(SealError::InvalidPayload(format!(
+            "payload footer must be exactly {FOOTER_SIZE} bytes"
+        )));
+    }
+
+    let mut original_hash = [0_u8; 32];
+    original_hash.copy_from_slice(&data[..32]);
+
+    let mut launcher_hash = [0_u8; 32];
+    launcher_hash.copy_from_slice(&data[32..]);
+
+    Ok(PayloadFooter {
+        original_hash,
+        launcher_hash,
+    })
 }
 
 fn parse_header(bytes: &[u8]) -> Result<PayloadHeader, SealError> {
@@ -364,12 +385,76 @@ mod tests {
 
         let payload = serialize_header(&header).to_vec();
         let err = unpack_payload(Cursor::new(payload), &key).expect_err("missing nonce must fail");
-        match err {
-            SealError::InvalidPayload(message) => {
-                assert!(message.contains("missing stream nonce"));
-            }
-            other => panic!("expected invalid payload, got {other:?}"),
-        }
+        assert!(
+            matches!(err, SealError::InvalidPayload(message) if message.contains("missing stream nonce"))
+        );
+    }
+
+    #[test]
+    fn pack_payload_sets_header_fields_for_non_empty_plaintext() {
+        let key = [63_u8; 32];
+        let plaintext = b"payload-bytes";
+
+        let payload = pack_payload(Cursor::new(plaintext), &key).expect("pack should succeed");
+        let header = parse_header(&payload[..HEADER_SIZE]).expect("header should parse");
+
+        assert_eq!(header.magic, MAGIC_BYTES);
+        assert_eq!(header.version, VERSION_V1);
+        assert_eq!(header.enc_alg, ENC_ALG_AES256_GCM);
+        assert_eq!(header.fmt_version, FMT_STREAM);
+        assert_eq!(header.chunk_count, 1);
+    }
+
+    #[test]
+    fn pack_payload_encrypts_plaintext_bytes_beyond_header() {
+        let key = [64_u8; 32];
+        let plaintext = b"secret-body";
+
+        let payload = pack_payload(Cursor::new(plaintext), &key).expect("pack should succeed");
+
+        assert!(payload.len() > HEADER_SIZE + NONCE_SIZE);
+        assert_ne!(
+            &payload[HEADER_SIZE..HEADER_SIZE + NONCE_SIZE],
+            &[0_u8; NONCE_SIZE]
+        );
+        assert_ne!(&payload[HEADER_SIZE + NONCE_SIZE..], plaintext);
+    }
+
+    #[test]
+    fn unpack_payload_round_trips_single_chunk_body() {
+        let key = [65_u8; 32];
+        let plaintext = b"single-chunk-body".to_vec();
+        let payload = pack_payload(Cursor::new(&plaintext), &key).expect("pack should succeed");
+
+        let (decrypted, header) =
+            unpack_payload(Cursor::new(payload), &key).expect("unpack should succeed");
+
+        assert_eq!(decrypted, plaintext);
+        assert_eq!(header.chunk_count, 1);
+    }
+
+    #[test]
+    fn validate_payload_header_returns_same_header_as_parse_header() {
+        let key = [66_u8; 32];
+        let plaintext = b"validate-me";
+        let payload = pack_payload(Cursor::new(plaintext), &key).expect("pack should succeed");
+
+        let validated = validate_payload_header(&payload).expect("validation should succeed");
+        let parsed = parse_header(&payload[..HEADER_SIZE]).expect("parse should succeed");
+
+        assert_eq!(validated, parsed);
+    }
+
+    #[test]
+    fn read_footer_parses_hash_halves_in_order() {
+        let mut bytes = [0_u8; FOOTER_SIZE];
+        bytes[..32].copy_from_slice(&[0x12; 32]);
+        bytes[32..].copy_from_slice(&[0x34; 32]);
+
+        let footer = read_footer(&bytes).expect("footer should parse");
+
+        assert_eq!(footer.original_hash, [0x12; 32]);
+        assert_eq!(footer.launcher_hash, [0x34; 32]);
     }
 
     #[test]
@@ -469,6 +554,45 @@ mod tests {
         );
 
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn write_footer_produces_exactly_64_bytes() {
+        let footer = PayloadFooter {
+            original_hash: [0x11; 32],
+            launcher_hash: [0x22; 32],
+        };
+
+        let bytes = write_footer(&footer);
+
+        assert_eq!(bytes.len(), FOOTER_SIZE);
+        assert_eq!(&bytes[..32], &[0x11; 32]);
+        assert_eq!(&bytes[32..], &[0x22; 32]);
+    }
+
+    #[test]
+    fn footer_round_trip() {
+        let footer = PayloadFooter {
+            original_hash: [0x33; 32],
+            launcher_hash: [0x44; 32],
+        };
+
+        let bytes = write_footer(&footer);
+        let parsed = read_footer(&bytes).expect("footer should parse");
+
+        assert_eq!(parsed, footer);
+    }
+
+    #[test]
+    fn read_footer_rejects_shorter_than_64_bytes() {
+        let err = read_footer(&[0xAA; FOOTER_SIZE - 1]).expect_err("short footer must fail");
+        assert!(matches!(err, SealError::InvalidPayload(_)));
+    }
+
+    #[test]
+    fn read_footer_rejects_longer_than_64_bytes() {
+        let err = read_footer(&[0xBB; FOOTER_SIZE + 1]).expect_err("long footer must fail");
+        assert!(matches!(err, SealError::InvalidPayload(_)));
     }
 
     #[test]

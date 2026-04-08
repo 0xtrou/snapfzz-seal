@@ -31,8 +31,11 @@ pub struct ChunkRecord {
     pub data: Vec<u8>, // ciphertext + 16-byte tag
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct PayloadFooter {}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PayloadFooter {
+    pub original_hash: [u8; 32],
+    pub launcher_hash: [u8; 32],
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {

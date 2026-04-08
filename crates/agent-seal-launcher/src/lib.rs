@@ -6,11 +6,15 @@ mod self_delete;
 
 use std::io::Cursor;
 
+#[cfg(target_os = "linux")]
+use agent_seal_core::tamper;
 use agent_seal_core::{
     derive::{derive_env_key, derive_session_key},
     error::SealError,
-    payload::{unpack_payload, validate_payload_header},
-    types::{LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER},
+    payload::{read_footer, unpack_payload, validate_payload_header},
+    types::{
+        LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER, LAUNCHER_TAMPER_MARKER, PayloadFooter,
+    },
 };
 use agent_seal_fingerprint::{
     FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
@@ -43,6 +47,9 @@ pub struct Cli {
 pub fn run(cli: Cli) -> Result<(), SealError> {
     let payload_bytes = load_payload_bytes(cli.payload.as_deref())?;
     validate_payload_header(&payload_bytes)?;
+    let _footer = extract_footer(&payload_bytes).map_err(|_| {
+        SealError::InvalidPayload("missing or corrupted payload footer".to_string())
+    })?;
 
     let protections = anti_debug::apply_protections()?;
     tracing::info!(?protections, "anti-debug protections evaluated");
@@ -68,7 +75,7 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     )?;
 
     let decrypted = Zeroizing::new(
-        match unpack_payload(Cursor::new(payload_bytes), &decryption_key) {
+        match unpack_payload(Cursor::new(&payload_bytes), &decryption_key) {
             Ok((bytes, _header)) => bytes,
             Err(SealError::DecryptionFailed(_)) => {
                 eprintln!(
@@ -82,6 +89,9 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
 
     decryption_key.zeroize();
     master_secret.zeroize();
+
+    let tamper_hash = extract_embedded_tamper_hash(&payload_bytes)?;
+    verify_embedded_tamper_hash(&tamper_hash)?;
 
     self_delete::self_delete()?;
 
@@ -161,6 +171,17 @@ fn load_payload_bytes(payload_arg: Option<&str>) -> Result<Vec<u8>, SealError> {
             extract_payload_from_assembled_binary(&executable_bytes)
         }
     }
+}
+
+pub fn extract_footer(payload_bytes: &[u8]) -> Result<PayloadFooter, SealError> {
+    if payload_bytes.len() < 64 {
+        return Err(SealError::InvalidPayload(
+            "payload too small to contain footer".to_string(),
+        ));
+    }
+
+    let footer_start = payload_bytes.len() - 64;
+    read_footer(&payload_bytes[footer_start..])
 }
 
 fn extract_payload_from_assembled_binary(executable_bytes: &[u8]) -> Result<Vec<u8>, SealError> {
@@ -273,6 +294,40 @@ fn extract_embedded_master_secret(payload_bytes: &[u8]) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn extract_embedded_tamper_hash(payload_bytes: &[u8]) -> Result<[u8; 32], SealError> {
+    let marker_offset = find_marker(payload_bytes, LAUNCHER_TAMPER_MARKER).ok_or_else(|| {
+        SealError::InvalidInput(
+            "embedded tamper hash marker not found in payload bytes".to_string(),
+        )
+    })?;
+    let hash_offset = marker_offset + LAUNCHER_TAMPER_MARKER.len();
+    let hash_end = hash_offset + 32;
+
+    if payload_bytes.len() < hash_end {
+        return Err(SealError::InvalidInput(
+            "embedded tamper hash marker found but hash bytes are truncated".to_string(),
+        ));
+    }
+
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&payload_bytes[hash_offset..hash_end]);
+    Ok(hash)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_embedded_tamper_hash(tamper_hash: &[u8; 32]) -> Result<(), SealError> {
+    tamper::verify_tamper(tamper_hash)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verify_embedded_tamper_hash(tamper_hash: &[u8; 32]) -> Result<(), SealError> {
+    tracing::warn!(
+        tamper_hash = %hex::encode(tamper_hash),
+        "embedded tamper hash found but tamper verification is skipped on non-Linux platforms"
+    );
+    Ok(())
+}
+
 fn load_master_secret_from_env() -> Result<[u8; 32], SealError> {
     let raw = std::env::var("AGENT_SEAL_MASTER_SECRET_HEX").map_err(|_| {
         tracing::error!("AGENT_SEAL_MASTER_SECRET_HEX is required");
@@ -300,7 +355,11 @@ fn load_master_secret_from_env() -> Result<[u8; 32], SealError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_seal_core::derive::{derive_env_key, derive_session_key};
+    use agent_seal_core::{
+        derive::{derive_env_key, derive_session_key},
+        payload::write_footer,
+        types::PayloadFooter,
+    };
     use agent_seal_fingerprint::{
         FingerprintSnapshot, RuntimeKind, SourceValue, Stability, canonicalize_ephemeral,
         canonicalize_stable,
@@ -421,6 +480,41 @@ mod tests {
     }
 
     #[test]
+    fn extract_footer_reads_valid_footer() {
+        let footer = PayloadFooter {
+            original_hash: [0x11; 32],
+            launcher_hash: [0x22; 32],
+        };
+        let mut payload_bytes = b"ASL\x01encrypted-payload".to_vec();
+        payload_bytes.extend_from_slice(&write_footer(&footer));
+
+        let extracted = extract_footer(&payload_bytes).expect("footer should parse");
+
+        assert_eq!(extracted, footer);
+    }
+
+    #[test]
+    fn extract_footer_errors_on_short_payload() {
+        let err = extract_footer(&[0xAA; 63]).expect_err("short payload must fail");
+        assert!(matches!(err, SealError::InvalidPayload(_)));
+    }
+
+    #[test]
+    fn extract_footer_round_trips_with_write_footer() {
+        let footer = PayloadFooter {
+            original_hash: [0x33; 32],
+            launcher_hash: [0x44; 32],
+        };
+        let footer_bytes = write_footer(&footer);
+
+        let mut payload_bytes = vec![0x55; 128];
+        payload_bytes.extend_from_slice(&footer_bytes);
+
+        let extracted = extract_footer(&payload_bytes).expect("footer should parse");
+        assert_eq!(extracted, footer);
+    }
+
+    #[test]
     fn extract_payload_from_launcher_size_env_skips_sentinel() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
@@ -505,6 +599,47 @@ mod tests {
         unsafe {
             std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
         }
+    }
+
+    #[test]
+    fn extract_embedded_tamper_hash_reads_hash_after_marker() {
+        let hash = [0x7C; 32];
+        let mut binary = vec![0xAA; 16];
+        binary.extend_from_slice(LAUNCHER_TAMPER_MARKER);
+        binary.extend_from_slice(&hash);
+        binary.extend_from_slice(&[0xBB; 16]);
+
+        let extracted = extract_embedded_tamper_hash(&binary).expect("tamper hash should load");
+        assert_eq!(extracted, hash);
+    }
+
+    #[test]
+    fn extract_embedded_tamper_hash_errors_when_marker_missing() {
+        let err = extract_embedded_tamper_hash(b"no-tamper-marker").expect_err("must fail");
+        assert!(matches!(err, SealError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn extract_embedded_tamper_hash_errors_when_hash_bytes_truncated() {
+        let mut binary = vec![0xAA; 16];
+        binary.extend_from_slice(LAUNCHER_TAMPER_MARKER);
+        binary.extend_from_slice(&[0xEE; 31]);
+
+        let err = extract_embedded_tamper_hash(&binary).expect_err("must fail");
+        assert!(matches!(err, SealError::InvalidInput(_)));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn verify_embedded_tamper_hash_skips_on_non_linux() {
+        verify_embedded_tamper_hash(&[0xAB; 32]).expect("non-linux should skip tamper check");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_embedded_tamper_hash_detects_mismatch_on_linux() {
+        let err = verify_embedded_tamper_hash(&[0xAB; 32]).expect_err("wrong hash must fail");
+        assert!(matches!(err, SealError::TamperDetected));
     }
 
     #[test]
