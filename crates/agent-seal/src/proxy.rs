@@ -16,7 +16,7 @@ pub fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .build()?
         .block_on(async {
             let state = agent_seal_proxy::state::ProxyState::new(cli.provider_key, cli.provider);
-            let app = agent_seal_proxy::create_app(state);
+            let app = agent_seal_proxy::try_create_app(state)?;
             let addr: std::net::SocketAddr = cli.bind.parse()?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             tracing::info!("agent-seal proxy listening on {}", addr);

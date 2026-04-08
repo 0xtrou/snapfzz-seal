@@ -7,12 +7,14 @@ mod self_delete;
 use std::io::Cursor;
 
 use agent_seal_core::{
-    derive::derive_env_key,
+    derive::{derive_env_key, derive_session_key},
     error::SealError,
     payload::{unpack_payload, validate_payload_header},
-    types::LAUNCHER_PAYLOAD_SENTINEL,
+    types::{LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER},
 };
-use agent_seal_fingerprint::{FingerprintCollector, canonicalize_stable};
+use agent_seal_fingerprint::{
+    FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
+};
 use clap::{Parser, ValueEnum};
 use memfd_exec::{ExecConfig, KernelMemfdOps, MemfdExecutor};
 use tracing_subscriber::EnvFilter;
@@ -55,23 +57,30 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
             .map_err(|err| SealError::InvalidInput(err.to_string()))?,
     };
 
-    let stable_hash = canonicalize_stable(&snapshot);
     let user_fingerprint = decode_user_fingerprint(cli.user_fingerprint)?;
-    let mut master_secret = load_master_secret()?;
+    let mut master_secret = load_master_secret(&payload_bytes)?;
 
-    let mut env_key = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)?;
-    let decrypted = Zeroizing::new(match unpack_payload(Cursor::new(payload_bytes), &env_key) {
-        Ok((bytes, _header)) => bytes,
-        Err(SealError::DecryptionFailed(_)) => {
-            eprintln!(
-                "ERROR: fingerprint mismatch — sandbox environment has changed, re-provisioning required"
-            );
-            std::process::exit(1);
-        }
-        Err(err) => return Err(err),
-    });
+    let mut decryption_key = derive_decryption_key(
+        &master_secret,
+        &user_fingerprint,
+        &snapshot,
+        cli.fingerprint_mode,
+    )?;
 
-    env_key.zeroize();
+    let decrypted = Zeroizing::new(
+        match unpack_payload(Cursor::new(payload_bytes), &decryption_key) {
+            Ok((bytes, _header)) => bytes,
+            Err(SealError::DecryptionFailed(_)) => {
+                eprintln!(
+                    "ERROR: fingerprint mismatch — sandbox environment has changed, re-provisioning required"
+                );
+                std::process::exit(1);
+            }
+            Err(err) => return Err(err),
+        },
+    );
+
+    decryption_key.zeroize();
     master_secret.zeroize();
 
     self_delete::self_delete()?;
@@ -89,6 +98,23 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     })?;
     println!("{json}");
     Ok(())
+}
+
+fn derive_decryption_key(
+    master_secret: &[u8; 32],
+    user_fingerprint: &[u8; 32],
+    snapshot: &FingerprintSnapshot,
+    fingerprint_mode: FingerprintMode,
+) -> Result<[u8; 32], SealError> {
+    let stable_hash = canonicalize_stable(snapshot);
+    let env_key = derive_env_key(master_secret, &stable_hash, user_fingerprint)?;
+
+    if fingerprint_mode == FingerprintMode::Session {
+        let ephemeral_hash = canonicalize_ephemeral(snapshot);
+        derive_session_key(&env_key, &ephemeral_hash)
+    } else {
+        Ok(env_key)
+    }
 }
 
 pub fn init_tracing(verbose: bool) {
@@ -214,7 +240,40 @@ fn decode_user_fingerprint(user_fingerprint_hex: Option<String>) -> Result<[u8; 
     Ok(out)
 }
 
-fn load_master_secret() -> Result<[u8; 32], SealError> {
+fn load_master_secret(payload_bytes: &[u8]) -> Result<[u8; 32], SealError> {
+    if let Some(secret) = extract_embedded_master_secret(payload_bytes) {
+        return Ok(secret);
+    }
+
+    load_master_secret_from_env()
+}
+
+fn extract_embedded_master_secret(payload_bytes: &[u8]) -> Option<[u8; 32]> {
+    let marker_offset = find_marker(payload_bytes, LAUNCHER_SECRET_MARKER)?;
+    let secret_offset = marker_offset + LAUNCHER_SECRET_MARKER.len();
+    let secret_end = secret_offset + 32;
+
+    if payload_bytes.len() < secret_end {
+        tracing::warn!("embedded launcher secret marker found but secret bytes are truncated");
+        return None;
+    }
+
+    let mut secret = [0_u8; 32];
+    secret.copy_from_slice(&payload_bytes[secret_offset..secret_end]);
+
+    let secret_hex = hex::encode(secret);
+    let decoded = hex::decode(secret_hex).ok()?;
+
+    if decoded.len() != 32 {
+        return None;
+    }
+
+    let mut out = [0_u8; 32];
+    out.copy_from_slice(&decoded);
+    Some(out)
+}
+
+fn load_master_secret_from_env() -> Result<[u8; 32], SealError> {
     let raw = std::env::var("AGENT_SEAL_MASTER_SECRET_HEX").map_err(|_| {
         tracing::error!("AGENT_SEAL_MASTER_SECRET_HEX is required");
         SealError::InvalidInput(
@@ -241,12 +300,52 @@ fn load_master_secret() -> Result<[u8; 32], SealError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_seal_core::derive::{derive_env_key, derive_session_key};
+    use agent_seal_fingerprint::{
+        FingerprintSnapshot, RuntimeKind, SourceValue, Stability, canonicalize_ephemeral,
+        canonicalize_stable,
+    };
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     static TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn source(id: &str, value: &'static [u8], stability: Stability) -> SourceValue {
+        SourceValue {
+            id: id.to_string(),
+            value: value.to_vec(),
+            confidence: 90,
+            stability,
+        }
+    }
+
+    fn sample_snapshot(ephemeral_value: &'static [u8]) -> FingerprintSnapshot {
+        FingerprintSnapshot {
+            runtime: RuntimeKind::Docker,
+            stable: vec![
+                source("linux.hostname", b"sandbox-a", Stability::Stable),
+                source("linux.kernel_release", b"6.9.3", Stability::Stable),
+            ],
+            ephemeral: vec![source(
+                "linux.pid_namespace_inode",
+                ephemeral_value,
+                Stability::Ephemeral,
+            )],
+            collected_at_unix_ms: 42,
+        }
+    }
+
+    fn derive_launcher_key(
+        master_secret: &[u8; 32],
+        user_fingerprint: &[u8; 32],
+        snapshot: &FingerprintSnapshot,
+        fingerprint_mode: FingerprintMode,
+    ) -> [u8; 32] {
+        derive_decryption_key(master_secret, user_fingerprint, snapshot, fingerprint_mode)
+            .expect("launcher key derivation should succeed")
+    }
 
     fn unique_temp_path(stem: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -342,13 +441,80 @@ mod tests {
     }
 
     #[test]
+    fn load_master_secret_extracts_embedded_secret_from_binary_bytes() {
+        let secret = [0x5A; 32];
+        let path = unique_temp_path("embedded-secret");
+        let mut binary = vec![0xAA; 16];
+        binary.extend_from_slice(LAUNCHER_SECRET_MARKER);
+        binary.extend_from_slice(&secret);
+        binary.extend_from_slice(&[0xBB; 16]);
+        std::fs::write(&path, &binary).unwrap();
+
+        let payload_bytes = std::fs::read(&path).unwrap();
+        let loaded = load_master_secret(&payload_bytes).expect("embedded secret should load");
+        assert_eq!(loaded, secret);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn load_master_secret_falls_back_to_env_when_marker_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "ab".repeat(32));
+        }
+
+        let loaded = load_master_secret(b"no-secret-marker").expect("env fallback should load");
+        assert_eq!(loaded, [0xAB; 32]);
+
+        unsafe {
+            std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
+        }
+    }
+
+    #[test]
+    fn env_var_set_overrides_when_no_marker_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "ef".repeat(32));
+        }
+
+        let loaded =
+            load_master_secret(&[0x42; 64]).expect("env fallback should win without marker");
+        assert_eq!(loaded, [0xEF; 32]);
+
+        unsafe {
+            std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
+        }
+    }
+
+    #[test]
+    fn load_master_secret_falls_back_to_env_when_marker_payload_truncated() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "cd".repeat(32));
+        }
+
+        let mut binary = vec![0xAA; 16];
+        binary.extend_from_slice(LAUNCHER_SECRET_MARKER);
+        binary.extend_from_slice(&[0xEE; 31]);
+
+        let loaded = load_master_secret(&binary).expect("truncated marker should fall back");
+        assert_eq!(loaded, [0xCD; 32]);
+
+        unsafe {
+            std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
+        }
+    }
+
+    #[test]
     fn load_master_secret_fails_when_env_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
         }
 
-        let err = load_master_secret().expect_err("missing env must fail");
+        let err = load_master_secret(b"no-secret-marker").expect_err("missing env must fail");
         assert!(matches!(err, SealError::InvalidInput(_)));
     }
 
@@ -556,7 +722,7 @@ mod tests {
             std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "zzzz");
         }
 
-        let err = load_master_secret().expect_err("must fail");
+        let err = load_master_secret(b"no-secret-marker").expect_err("must fail");
         assert!(matches!(err, SealError::InvalidInput(_)));
 
         unsafe {
@@ -571,12 +737,103 @@ mod tests {
             std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "aa".repeat(31));
         }
 
-        let err = load_master_secret().expect_err("must fail");
+        let err = load_master_secret(b"no-secret-marker").expect_err("must fail");
         assert!(matches!(err, SealError::InvalidInput(_)));
 
         unsafe {
             std::env::remove_var("AGENT_SEAL_MASTER_SECRET_HEX");
         }
+    }
+
+    #[test]
+    fn stable_mode_uses_stable_fingerprint_without_session_derivation() {
+        let master_secret = [0x11; 32];
+        let user_fingerprint = [0x22; 32];
+        let snapshot = sample_snapshot(b"4026531836");
+
+        let stable_key = derive_launcher_key(
+            &master_secret,
+            &user_fingerprint,
+            &snapshot,
+            FingerprintMode::Stable,
+        );
+        let stable_hash = canonicalize_stable(&snapshot);
+        let expected = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
+            .expect("env key derivation should succeed");
+
+        assert_eq!(stable_key, expected);
+    }
+
+    #[test]
+    fn session_mode_uses_ephemeral_fingerprint_for_session_derivation() {
+        let master_secret = [0x33; 32];
+        let user_fingerprint = [0x44; 32];
+        let snapshot = sample_snapshot(b"4026531836");
+
+        let session_key = derive_launcher_key(
+            &master_secret,
+            &user_fingerprint,
+            &snapshot,
+            FingerprintMode::Session,
+        );
+        let stable_hash = canonicalize_stable(&snapshot);
+        let env_key = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
+            .expect("env key derivation should succeed");
+        let ephemeral_hash = canonicalize_ephemeral(&snapshot);
+        let expected = derive_session_key(&env_key, &ephemeral_hash)
+            .expect("session key derivation should succeed");
+
+        assert_eq!(session_key, expected);
+        assert_ne!(session_key, env_key);
+    }
+
+    #[test]
+    fn different_ephemeral_fingerprints_produce_different_session_keys() {
+        let master_secret = [0x55; 32];
+        let user_fingerprint = [0x66; 32];
+        let snapshot_a = sample_snapshot(b"4026531836");
+        let snapshot_b = sample_snapshot(b"4026531900");
+
+        let key_a = derive_launcher_key(
+            &master_secret,
+            &user_fingerprint,
+            &snapshot_a,
+            FingerprintMode::Session,
+        );
+        let key_b = derive_launcher_key(
+            &master_secret,
+            &user_fingerprint,
+            &snapshot_b,
+            FingerprintMode::Session,
+        );
+
+        assert_ne!(
+            canonicalize_ephemeral(&snapshot_a),
+            canonicalize_ephemeral(&snapshot_b)
+        );
+        assert_eq!(
+            canonicalize_stable(&snapshot_a),
+            canonicalize_stable(&snapshot_b)
+        );
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn derive_session_key_is_deterministic_for_same_input() {
+        let master_secret = [0x77; 32];
+        let user_fingerprint = [0x88; 32];
+        let snapshot = sample_snapshot(b"4026531836");
+        let stable_hash = canonicalize_stable(&snapshot);
+        let env_key = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
+            .expect("env key derivation should succeed");
+        let ephemeral_hash = canonicalize_ephemeral(&snapshot);
+
+        let first = derive_session_key(&env_key, &ephemeral_hash)
+            .expect("session key derivation should succeed");
+        let second = derive_session_key(&env_key, &ephemeral_hash)
+            .expect("session key derivation should succeed");
+
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -663,7 +920,7 @@ mod tests {
             std::env::set_var("AGENT_SEAL_MASTER_SECRET_HEX", "ab".repeat(32));
         }
 
-        let secret = load_master_secret().unwrap();
+        let secret = load_master_secret(b"no-secret-marker").unwrap();
         assert_eq!(secret, [0xAB; 32]);
 
         unsafe {

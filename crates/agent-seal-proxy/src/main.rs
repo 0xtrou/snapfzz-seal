@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let state = agent_seal_proxy::state::ProxyState::new(cli.provider_key, cli.provider);
-    let app = agent_seal_proxy::create_app(state);
+    let app = agent_seal_proxy::try_create_app(state)?;
 
     let bind_addr: SocketAddr = cli.bind.parse()?;
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;

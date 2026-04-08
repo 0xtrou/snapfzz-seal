@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use agent_seal_compiler::compile::{Backend, compile_agent};
+use agent_seal_compiler::{Cli as CompilerCli, CliBackend};
 use axum::{
     Json, Router,
     extract::{Path, State},
@@ -13,6 +13,7 @@ use axum::{
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::debug;
 
 use crate::sandbox::{SandboxConfig, SandboxProvisioner, copy_into_sandbox, exec_in_sandbox};
 use crate::state::{JobState, ServerState};
@@ -67,16 +68,16 @@ async fn compile(
     State(state): State<ServerState>,
     Json(req): Json<CompileRequest>,
 ) -> impl IntoResponse {
-    let _ = (&req.user_fingerprint, &req.sandbox_fingerprint);
-
     let job_id = new_job_id();
     let created = state
         .create_job(job_id.clone(), Some(req.project_dir.clone()))
         .await;
 
     let state_for_task = state.clone();
-    let project_dir = req.project_dir;
     let compile_output_dir = state.compile_dir.join(&job_id);
+    let output_path = state.output_dir.join(format!("{job_id}.sealed"));
+    let compile_options =
+        compiler_options_from_request(req, compile_output_dir.clone(), output_path);
     let job_id_for_task = job_id.clone();
 
     tokio::spawn(async move {
@@ -99,18 +100,31 @@ async fn compile(
             return;
         }
 
-        let project_dir_path = PathBuf::from(&project_dir);
-        let output_path = tokio::task::spawn_blocking(move || {
-            compile_agent(&project_dir_path, &compile_output_dir, Backend::Nuitka)
+        if let Err(err) = tokio::fs::create_dir_all(&state_for_task.output_dir).await {
+            let _: Result<_, std::convert::Infallible> = state_for_task
+                .update_job(&job_id_for_task, |job| {
+                    job.status = JobState::Failed;
+                    job.error = Some(format!("failed to create output directory: {err}"));
+                    Ok(())
+                })
+                .await;
+            return;
+        }
+
+        let output_path_str = compile_options.cli.output.to_string_lossy().to_string();
+        let fingerprint_mode = compile_options.fingerprint_mode;
+        let compile_result = tokio::task::spawn_blocking(move || {
+            debug!(?fingerprint_mode, "resolved compile fingerprint mode");
+            agent_seal_compiler::run(compile_options.cli)
         })
         .await;
 
-        match output_path {
-            Ok(Ok(path)) => {
+        match compile_result {
+            Ok(Ok(())) => {
                 let _: Result<_, std::convert::Infallible> = state_for_task
                     .update_job(&job_id_for_task, |job| {
                         job.status = JobState::Ready;
-                        job.output_path = Some(path.to_string_lossy().to_string());
+                        job.output_path = Some(output_path_str);
                         job.error = None;
                         Ok(())
                     })
@@ -347,6 +361,41 @@ fn new_job_id() -> String {
     format!("job-{now}-{seq}-{}", random_hex_4())
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FingerprintMode {
+    Stable,
+    Session,
+}
+
+#[derive(Debug)]
+struct CompileOptions {
+    cli: CompilerCli,
+    fingerprint_mode: FingerprintMode,
+}
+
+fn compiler_options_from_request(
+    req: CompileRequest,
+    compile_output_dir: PathBuf,
+    output_path: PathBuf,
+) -> CompileOptions {
+    let fingerprint_mode = match req.sandbox_fingerprint.as_str() {
+        "ephemeral" => FingerprintMode::Session,
+        _ => FingerprintMode::Stable,
+    };
+
+    CompileOptions {
+        cli: CompilerCli {
+            project: PathBuf::from(req.project_dir),
+            user_fingerprint: req.user_fingerprint,
+            sandbox_fingerprint: req.sandbox_fingerprint,
+            output: output_path,
+            backend: CliBackend::Nuitka,
+            launcher: Some(compile_output_dir.join("agent-seal-launcher")),
+        },
+        fingerprint_mode,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -371,7 +420,10 @@ mod tests {
         state::{JobState, ServerState},
     };
 
-    use super::{build_router, new_job_id, random_hex_4};
+    use super::{
+        CompileRequest, FingerprintMode, build_router, compiler_options_from_request, new_job_id,
+        random_hex_4,
+    };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -432,6 +484,57 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("job did not reach expected status");
+    }
+
+    #[test]
+    fn compile_request_with_ephemeral_sandbox_uses_session_mode() {
+        let request = CompileRequest {
+            project_dir: "/tmp/project".to_string(),
+            user_fingerprint: "11".repeat(32),
+            sandbox_fingerprint: "ephemeral".to_string(),
+        };
+
+        let options = compiler_options_from_request(
+            request,
+            PathBuf::from("/tmp/project"),
+            PathBuf::from("/tmp/output.bin"),
+        );
+
+        assert_eq!(options.fingerprint_mode, FingerprintMode::Session);
+    }
+
+    #[test]
+    fn compile_request_with_auto_sandbox_uses_stable_mode() {
+        let request = CompileRequest {
+            project_dir: "/tmp/project".to_string(),
+            user_fingerprint: "11".repeat(32),
+            sandbox_fingerprint: "auto".to_string(),
+        };
+
+        let options = compiler_options_from_request(
+            request,
+            PathBuf::from("/tmp/project"),
+            PathBuf::from("/tmp/output.bin"),
+        );
+
+        assert_eq!(options.fingerprint_mode, FingerprintMode::Stable);
+    }
+
+    #[test]
+    fn compile_request_passes_explicit_user_fingerprint_to_compiler() {
+        let request = CompileRequest {
+            project_dir: "/tmp/project".to_string(),
+            user_fingerprint: "ab".repeat(32),
+            sandbox_fingerprint: "auto".to_string(),
+        };
+
+        let options = compiler_options_from_request(
+            request,
+            PathBuf::from("/tmp/project"),
+            PathBuf::from("/tmp/output.bin"),
+        );
+
+        assert_eq!(options.cli.user_fingerprint, "ab".repeat(32));
     }
 
     #[tokio::test]

@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::info;
 
+use agent_seal_core::error::SealError;
+
 use crate::{
     auth::{VirtualKeyAuth, admin_auth_middleware},
     provider::{provider_endpoint, provider_for_model, proxy_request},
@@ -62,10 +64,12 @@ pub struct KeyListItem {
     pub revoked: bool,
 }
 
-pub fn build_router(state: AppState) -> Router {
-    let admin_token =
-        std::env::var("AGENT_SEAL_ADMIN_TOKEN").unwrap_or_else(|_| "dev-admin-token".to_string());
+pub fn build_router(state: AppState) -> Result<Router, SealError> {
+    let admin_token = resolve_admin_token(std::env::var("AGENT_SEAL_ADMIN_TOKEN").ok())?;
+    Ok(build_router_with_admin_token(state, admin_token))
+}
 
+pub(crate) fn build_router_with_admin_token(state: AppState, admin_token: String) -> Router {
     let admin_routes = Router::new()
         .route("/admin/keys", post(create_key).get(list_keys))
         .route("/admin/keys/{key_id}", delete(revoke_key))
@@ -80,6 +84,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .merge(admin_routes)
         .with_state(state)
+}
+
+pub(crate) fn resolve_admin_token(admin_token: Option<String>) -> Result<String, SealError> {
+    admin_token.ok_or_else(|| {
+        SealError::InvalidInput("AGENT_SEAL_ADMIN_TOKEN env var is required".to_string())
+    })
 }
 
 async fn health() -> impl IntoResponse {
@@ -264,6 +274,8 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
+    const ADMIN_TOKEN: &str = "test-admin-token";
+
     use agent_seal_core::error::SealError;
     use axum::{
         body::Body,
@@ -278,14 +290,16 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{AppState, build_router, random_string, unix_ts_secs};
+    use super::{
+        AppState, build_router_with_admin_token, random_string, resolve_admin_token, unix_ts_secs,
+    };
     use crate::{
         auth::VirtualKeyAuth,
-        create_app,
         provider::{ProviderConfig, provider_endpoint, provider_for_model, proxy_request},
         rate_limit::RateLimitLayer,
         state::{ProxyState, VirtualKey},
         stream::stream_response,
+        try_create_app_with_admin_token,
     };
 
     async fn response_json(response: axum::response::Response) -> Value {
@@ -307,7 +321,8 @@ mod tests {
                 u64::MAX,
             ))
             .await;
-        create_app(state)
+        try_create_app_with_admin_token(state, Some(ADMIN_TOKEN.to_string()))
+            .expect("app should build when admin token is provided")
     }
 
     fn failing_http_client() -> Client {
@@ -347,10 +362,11 @@ mod tests {
 
     #[tokio::test]
     async fn health_returns_ok() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some(ADMIN_TOKEN.to_string()),
+        )
+        .expect("app should build when admin token is provided");
         let response = app
             .oneshot(
                 Request::builder()
@@ -367,10 +383,11 @@ mod tests {
 
     #[tokio::test]
     async fn admin_keys_create_and_list() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some(ADMIN_TOKEN.to_string()),
+        )
+        .expect("app should build when admin token is provided");
         let create_response = app
             .clone()
             .oneshot(
@@ -378,7 +395,7 @@ mod tests {
                     .method("POST")
                     .uri("/admin/keys")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer dev-admin-token")
+                    .header("authorization", "Bearer test-admin-token")
                     .body(Body::from(r#"{"sandbox_id":"sbx-1","ttl_secs":3600}"#))
                     .unwrap(),
             )
@@ -393,7 +410,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/admin/keys")
-                    .header("authorization", "Bearer dev-admin-token")
+                    .header("authorization", "Bearer test-admin-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -406,10 +423,11 @@ mod tests {
 
     #[tokio::test]
     async fn admin_keys_revoke_key() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some(ADMIN_TOKEN.to_string()),
+        )
+        .expect("app should build when admin token is provided");
         let create_response = app
             .clone()
             .oneshot(
@@ -417,7 +435,7 @@ mod tests {
                     .method("POST")
                     .uri("/admin/keys")
                     .header("content-type", "application/json")
-                    .header("authorization", "Bearer dev-admin-token")
+                    .header("authorization", "Bearer test-admin-token")
                     .body(Body::from(r#"{"sandbox_id":"sbx-1","ttl_secs":3600}"#))
                     .unwrap(),
             )
@@ -433,7 +451,7 @@ mod tests {
                 Request::builder()
                     .method("DELETE")
                     .uri(format!("/admin/keys/{key_id}"))
-                    .header("authorization", "Bearer dev-admin-token")
+                    .header("authorization", "Bearer test-admin-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -444,10 +462,11 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_without_auth_returns_401() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some(ADMIN_TOKEN.to_string()),
+        )
+        .expect("app should build when admin token is provided");
         let response = app
             .oneshot(
                 Request::builder()
@@ -703,13 +722,16 @@ mod tests {
 
     #[tokio::test]
     async fn build_router_returns_router_that_serves_health() {
-        let app = build_router(AppState {
-            proxy: ProxyState::new("provider-key".to_string(), "openai".to_string()),
-            rate_limit: RateLimitLayer::new(
-                NonZeroU32::new(10).unwrap(),
-                NonZeroU32::new(2).unwrap(),
-            ),
-        });
+        let app = build_router_with_admin_token(
+            AppState {
+                proxy: ProxyState::new("provider-key".to_string(), "openai".to_string()),
+                rate_limit: RateLimitLayer::new(
+                    NonZeroU32::new(10).unwrap(),
+                    NonZeroU32::new(2).unwrap(),
+                ),
+            },
+            ADMIN_TOKEN.to_string(),
+        );
 
         let response = app
             .oneshot(
@@ -722,6 +744,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn resolve_admin_token_fails_without_env_value() {
+        let err = resolve_admin_token(None).expect_err("missing admin token should fail");
+
+        assert!(
+            matches!(err, SealError::InvalidInput(message) if message.contains("AGENT_SEAL_ADMIN_TOKEN"))
+        );
     }
 
     #[tokio::test]

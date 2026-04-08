@@ -141,8 +141,8 @@ mod tests {
             admin_auth_middleware, bearer_token, invalid_admin_response, invalid_key_response,
             validate_key,
         },
-        create_app,
         state::{ProxyState, VirtualKey},
+        try_create_app_with_admin_token,
     };
     use axum::{
         Router,
@@ -173,7 +173,8 @@ mod tests {
         state
             .add_key(build_key("key-1", "as-valid", u64::MAX, false))
             .await;
-        let app = create_app(state);
+        let app = try_create_app_with_admin_token(state, Some("test-admin-token".to_string()))
+            .expect("app should build when admin token is provided");
 
         let response = app
             .oneshot(
@@ -192,10 +193,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_key_returns_401() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some("test-admin-token".to_string()),
+        )
+        .expect("app should build when admin token is provided");
 
         let response = app
             .oneshot(
@@ -214,10 +216,11 @@ mod tests {
 
     #[tokio::test]
     async fn missing_key_returns_401() {
-        let app = create_app(ProxyState::new(
-            "provider-key".to_string(),
-            "openai".to_string(),
-        ));
+        let app = try_create_app_with_admin_token(
+            ProxyState::new("provider-key".to_string(), "openai".to_string()),
+            Some("test-admin-token".to_string()),
+        )
+        .expect("app should build when admin token is provided");
 
         let response = app
             .oneshot(
@@ -270,7 +273,8 @@ mod tests {
         state
             .add_key(build_key("key-1", "as-expired", 0, false))
             .await;
-        let app = create_app(state);
+        let app = try_create_app_with_admin_token(state, Some("test-admin-token".to_string()))
+            .expect("app should build when admin token is provided");
 
         let response = app
             .oneshot(
@@ -293,7 +297,8 @@ mod tests {
         state
             .add_key(build_key("key-1", "as-revoked", u64::MAX, true))
             .await;
-        let app = create_app(state);
+        let app = try_create_app_with_admin_token(state, Some("test-admin-token".to_string()))
+            .expect("app should build when admin token is provided");
 
         let response = app
             .oneshot(
