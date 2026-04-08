@@ -349,7 +349,14 @@ fn new_job_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::convert::Infallible;
+    use std::{
+        convert::Infallible,
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        process::Command as StdCommand,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use agent_seal_core::types::ExecutionResult;
     use axum::{
@@ -366,9 +373,46 @@ mod tests {
 
     use super::{build_router, new_job_id, random_hex_4};
 
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
     fn test_state() -> ServerState {
-        let root = std::env::temp_dir().join("agent-seal-server-tests");
+        let root = unique_temp_path("agent-seal-server-tests");
         ServerState::new(root.join("compile"), root.join("output"))
+    }
+
+    fn write_executable_script(path: &PathBuf, body: &str) {
+        fs::write(path, body).expect("script should be written");
+        let mut permissions = fs::metadata(path)
+            .expect("script metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("script should be executable");
+    }
+
+    fn run_dispatch_probe(mode: &str, envs: &[(&str, &str)]) -> std::process::Output {
+        let mut cmd = StdCommand::new(std::env::current_exe().expect("test binary path"));
+        cmd.arg("dispatch_subprocess_probe")
+            .arg("--nocapture")
+            .env("AGENT_SEAL_ROUTE_TEST_MODE", mode);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("subprocess should run")
+    }
+
+    fn assert_probe_success(output: std::process::Output) {
+        assert!(
+            output.status.success(),
+            "probe failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     async fn response_json(response: axum::response::Response) -> Value {
@@ -388,6 +432,147 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("job did not reach expected status");
+    }
+
+    #[tokio::test]
+    async fn dispatch_subprocess_probe() {
+        let Ok(mode) = std::env::var("AGENT_SEAL_ROUTE_TEST_MODE") else {
+            return;
+        };
+
+        match mode.as_str() {
+            "copy_failure" => {
+                let binary_path = std::env::var("AGENT_SEAL_TEST_BINARY_PATH")
+                    .expect("binary path should be set");
+                let state = test_state();
+                let job = state
+                    .create_job("probe-copy-failure".to_string(), None)
+                    .await;
+                let _: Result<(), Infallible> = state
+                    .update_job(&job.id, |job| {
+                        job.status = JobState::Ready;
+                        job.output_path = Some(binary_path.clone());
+                        Ok(())
+                    })
+                    .await;
+                let app = create_app(state.clone());
+
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/dispatch")
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(
+                                "{{\"job_id\":\"{}\",\"sandbox\":{{\"image\":\"python:3.11\",\"timeout_secs\":30}}}}",
+                                job.id
+                            )))
+                            .expect("request must be valid"),
+                    )
+                    .await
+                    .expect("dispatch should complete");
+
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                wait_for_status(&state, &job.id, JobState::Failed).await;
+                let updated = state.get_job(&job.id).await.expect("job should exist");
+                assert!(
+                    updated
+                        .error
+                        .as_deref()
+                        .expect("job should include error")
+                        .contains("sandbox copy failed")
+                );
+                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+            }
+            "exec_failure" => {
+                let binary_path = std::env::var("AGENT_SEAL_TEST_BINARY_PATH")
+                    .expect("binary path should be set");
+                let state = test_state();
+                let job = state
+                    .create_job("probe-exec-failure".to_string(), None)
+                    .await;
+                let _: Result<(), Infallible> = state
+                    .update_job(&job.id, |job| {
+                        job.status = JobState::Ready;
+                        job.output_path = Some(binary_path.clone());
+                        Ok(())
+                    })
+                    .await;
+                let app = create_app(state.clone());
+
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/dispatch")
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(
+                                "{{\"job_id\":\"{}\",\"sandbox\":{{\"image\":\"python:3.11\",\"timeout_secs\":30}}}}",
+                                job.id
+                            )))
+                            .expect("request must be valid"),
+                    )
+                    .await
+                    .expect("dispatch should complete");
+
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                wait_for_status(&state, &job.id, JobState::Failed).await;
+                let updated = state.get_job(&job.id).await.expect("job should exist");
+                assert!(
+                    updated
+                        .error
+                        .as_deref()
+                        .expect("job should include error")
+                        .contains("sandbox exec failed")
+                );
+                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+            }
+            "destroy_error" => {
+                let binary_path = std::env::var("AGENT_SEAL_TEST_BINARY_PATH")
+                    .expect("binary path should be set");
+                let state = test_state();
+                let job = state
+                    .create_job("probe-destroy-error".to_string(), None)
+                    .await;
+                let _: Result<(), Infallible> = state
+                    .update_job(&job.id, |job| {
+                        job.status = JobState::Ready;
+                        job.output_path = Some(binary_path.clone());
+                        Ok(())
+                    })
+                    .await;
+                let app = create_app(state.clone());
+
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/v1/dispatch")
+                            .header("content-type", "application/json")
+                            .body(Body::from(format!(
+                                "{{\"job_id\":\"{}\",\"sandbox\":{{\"image\":\"python:3.11\",\"timeout_secs\":30}}}}",
+                                job.id
+                            )))
+                            .expect("request must be valid"),
+                    )
+                    .await
+                    .expect("dispatch should complete");
+
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                wait_for_status(&state, &job.id, JobState::Completed).await;
+                let updated = state.get_job(&job.id).await.expect("job should exist");
+                assert_eq!(updated.result.as_ref().map(|r| r.exit_code), Some(0));
+                assert!(
+                    updated
+                        .error
+                        .as_deref()
+                        .expect("job should include error")
+                        .contains("sandbox destroy failed")
+                );
+                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+            }
+            other => panic!("unknown probe mode: {other}"),
+        }
     }
 
     #[tokio::test]
@@ -635,6 +820,151 @@ mod tests {
                 .expect("job should include error")
                 .contains("sandbox provision failed")
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_ready_job_copy_failure_marks_failed() {
+        let root = unique_temp_path("agent-seal-route-copy-failure");
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let docker_script = root.join("docker-copy-fail.sh");
+        write_executable_script(
+            &docker_script,
+            r##"#!/bin/sh
+set -eu
+cmd="$1"
+shift || true
+case "$cmd" in
+  run)
+    printf 'container-copy-fail\n'
+    ;;
+  cp)
+    printf 'copy failed\n' >&2
+    exit 7
+    ;;
+  rm)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected command: %s\n' "$cmd" >&2
+    exit 9
+    ;;
+esac
+"##,
+        );
+        let binary_path = root.join("agent-bin");
+        fs::write(&binary_path, b"binary").expect("binary fixture should be written");
+
+        let docker_bin = docker_script.to_string_lossy().to_string();
+        let binary = binary_path.to_string_lossy().to_string();
+        let output = run_dispatch_probe(
+            "copy_failure",
+            &[
+                ("DOCKER_BIN", docker_bin.as_str()),
+                ("AGENT_SEAL_TEST_BINARY_PATH", binary.as_str()),
+            ],
+        );
+
+        assert_probe_success(output);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dispatch_ready_job_exec_failure_marks_failed() {
+        let root = unique_temp_path("agent-seal-route-exec-failure");
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let docker_script = root.join("docker-exec-fail.sh");
+        write_executable_script(
+            &docker_script,
+            r##"#!/bin/sh
+set -eu
+cmd="$1"
+shift || true
+case "$cmd" in
+  run)
+    printf 'container-exec-fail\n'
+    ;;
+  cp)
+    exit 0
+    ;;
+  exec)
+    printf 'boom\n' >&2
+    exit 23
+    ;;
+  rm)
+    exit 0
+    ;;
+  *)
+    printf 'unexpected command: %s\n' "$cmd" >&2
+    exit 9
+    ;;
+esac
+"##,
+        );
+        let binary_path = root.join("agent-bin");
+        fs::write(&binary_path, b"binary").expect("binary fixture should be written");
+
+        let docker_bin = docker_script.to_string_lossy().to_string();
+        let binary = binary_path.to_string_lossy().to_string();
+        let output = run_dispatch_probe(
+            "exec_failure",
+            &[
+                ("DOCKER_BIN", docker_bin.as_str()),
+                ("AGENT_SEAL_TEST_BINARY_PATH", binary.as_str()),
+            ],
+        );
+
+        assert_probe_success(output);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn dispatch_ready_job_destroy_error_keeps_completed_result() {
+        let root = unique_temp_path("agent-seal-route-destroy-error");
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let docker_script = root.join("docker-destroy-error.sh");
+        write_executable_script(
+            &docker_script,
+            r##"#!/bin/sh
+set -eu
+cmd="$1"
+shift || true
+case "$cmd" in
+  run)
+    printf 'container-destroy-error\n'
+    ;;
+  cp)
+    exit 0
+    ;;
+  exec)
+    printf 'probe-stdout\n'
+    exit 0
+    ;;
+  rm)
+    printf 'destroy failed\n' >&2
+    exit 13
+    ;;
+  *)
+    printf 'unexpected command: %s\n' "$cmd" >&2
+    exit 9
+    ;;
+esac
+"##,
+        );
+        let binary_path = root.join("agent-bin");
+        fs::write(&binary_path, b"binary").expect("binary fixture should be written");
+
+        let docker_bin = docker_script.to_string_lossy().to_string();
+        let binary = binary_path.to_string_lossy().to_string();
+        let output = run_dispatch_probe(
+            "destroy_error",
+            &[
+                ("DOCKER_BIN", docker_bin.as_str()),
+                ("AGENT_SEAL_TEST_BINARY_PATH", binary.as_str()),
+            ],
+        );
+
+        assert_probe_success(output);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
