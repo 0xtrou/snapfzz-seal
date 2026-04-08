@@ -43,10 +43,9 @@ pub struct InteractiveHandle {
     stderr: Arc<Mutex<Vec<u8>>>,
     stdout_thread: JoinHandle<Result<(), SealError>>,
     stderr_thread: JoinHandle<Result<(), SealError>>,
-    max_lifetime: Option<Duration>,
-    grace_period: Duration,
-    start_time: Instant,
     signal_thread: Option<JoinHandle<()>>,
+    lifetime_thread: Option<JoinHandle<()>>,
+    child_reaped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl InteractiveHandle {
@@ -58,36 +57,15 @@ impl InteractiveHandle {
             .join()
             .map_err(|_| SealError::InvalidInput("stderr reader thread panicked".to_string()))??;
 
-        if let Some(ref max) = self.max_lifetime {
-            let elapsed = self.start_time.elapsed();
-            if elapsed >= *max {
-                tracing::warn!(
-                    "agent exceeded max lifetime ({:?} >= {:?}), sending SIGTERM",
-                    elapsed,
-                    max
-                );
-                let _ = signal::kill(self.child_pid, Signal::SIGTERM);
-
-                let deadline = Instant::now() + self.grace_period;
-                loop {
-                    match waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => break,
-                        Ok(_) => {
-                            if Instant::now() >= deadline {
-                                tracing::warn!("grace period expired, sending SIGKILL");
-                                let _ = signal::kill(self.child_pid, Signal::SIGKILL);
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(100));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
+        if let Some(lifetime_thread) = self.lifetime_thread {
+            let _ = lifetime_thread.join();
         }
 
-        let wait_status = waitpid(self.child_pid, None)
-            .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+        let wait_status = if self.child_reaped.load(std::sync::atomic::Ordering::Acquire) {
+            WaitStatus::Exited(self.child_pid, 128 + Signal::SIGTERM as i32)
+        } else {
+            waitpid(self.child_pid, None).map_err(|err| SealError::Io(std::io::Error::from(err)))?
+        };
 
         if let Some(signal_thread) = self.signal_thread {
             let _ = signal_thread.join();
@@ -119,6 +97,41 @@ impl InteractiveHandle {
             let _ = unsafe { signal::sigaction(Signal::SIGTERM, &sa) };
             let _ = unsafe { signal::sigaction(Signal::SIGINT, &sa) };
             std::thread::sleep(Duration::from_secs(86400));
+        })
+    }
+
+    fn spawn_lifetime_monitor(
+        child_pid: nix::unistd::Pid,
+        max_lifetime: Duration,
+        grace_period: Duration,
+        child_reaped: Arc<std::sync::atomic::AtomicBool>,
+    ) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(max_lifetime);
+            tracing::warn!(
+                "agent exceeded max lifetime ({:?}), sending SIGTERM",
+                max_lifetime
+            );
+            let _ = signal::kill(child_pid, Signal::SIGTERM);
+
+            let deadline = Instant::now() + grace_period;
+            loop {
+                match waitpid(child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => {
+                        child_reaped.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                    Ok(_) => {
+                        if Instant::now() >= deadline {
+                            tracing::warn!("grace period expired, sending SIGKILL");
+                            let _ = signal::kill(child_pid, Signal::SIGKILL);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(_) => break,
+                }
+            }
         })
     }
 }
@@ -319,16 +332,27 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                     Some(InteractiveHandle::spawn_signal_forwarder())
                 };
 
+                let child_reaped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let lifetime_reaped = Arc::clone(&child_reaped);
+
+                let lifetime_thread = config.max_lifetime_secs.map(|secs| {
+                    InteractiveHandle::spawn_lifetime_monitor(
+                        child,
+                        Duration::from_secs(secs),
+                        Duration::from_secs(config.grace_period_secs),
+                        lifetime_reaped,
+                    )
+                });
+
                 Ok(InteractiveHandle {
                     child_pid: child,
                     stdout,
                     stderr,
                     stdout_thread,
                     stderr_thread,
-                    max_lifetime: config.max_lifetime_secs.map(Duration::from_secs),
-                    grace_period: Duration::from_secs(config.grace_period_secs),
-                    start_time: Instant::now(),
                     signal_thread,
+                    lifetime_thread,
+                    child_reaped,
                 })
             }
         }
