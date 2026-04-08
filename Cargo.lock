@@ -64,6 +64,7 @@ dependencies = [
  "agent-seal-server",
  "axum",
  "clap",
+ "hex",
  "serde",
  "serde_json",
  "tokio",

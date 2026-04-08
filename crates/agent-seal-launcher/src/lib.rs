@@ -20,7 +20,7 @@ use agent_seal_fingerprint::{
     FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
 };
 use clap::{Parser, ValueEnum};
-use memfd_exec::{ExecConfig, KernelMemfdOps, MemfdExecutor};
+pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
 

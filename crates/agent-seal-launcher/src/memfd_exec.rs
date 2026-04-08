@@ -1,6 +1,8 @@
 use std::ffi::CString;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use agent_seal_core::{error::SealError, types::ExecutionResult};
 use nix::errno::Errno;
@@ -29,6 +31,43 @@ pub struct ExecConfig {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
+}
+
+pub struct InteractiveHandle {
+    child_pid: nix::unistd::Pid,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_thread: JoinHandle<Result<(), SealError>>,
+    stderr_thread: JoinHandle<Result<(), SealError>>,
+}
+
+impl InteractiveHandle {
+    pub fn wait(self) -> Result<ExecutionResult, SealError> {
+        self.stdout_thread
+            .join()
+            .map_err(|_| SealError::InvalidInput("stdout reader thread panicked".to_string()))??;
+        self.stderr_thread
+            .join()
+            .map_err(|_| SealError::InvalidInput("stderr reader thread panicked".to_string()))??;
+
+        let wait_status = waitpid(self.child_pid, None)
+            .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+
+        let stdout = self
+            .stdout
+            .lock()
+            .map_err(|_| SealError::InvalidInput("stdout buffer mutex poisoned".to_string()))?;
+        let stderr = self
+            .stderr
+            .lock()
+            .map_err(|_| SealError::InvalidInput("stderr buffer mutex poisoned".to_string()))?;
+
+        Ok(ExecutionResult {
+            exit_code: extract_exit_code(wait_status),
+            stdout: String::from_utf8_lossy(stdout.as_slice()).into_owned(),
+            stderr: String::from_utf8_lossy(stderr.as_slice()).into_owned(),
+        })
+    }
 }
 
 impl<Ops: MemfdOps> MemfdExecutor<Ops> {
@@ -119,6 +158,104 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                     exit_code: extract_exit_code(wait_status),
                     stdout,
                     stderr,
+                })
+            }
+        }
+    }
+
+    pub fn execute_interactive(
+        &self,
+        binary_data: &[u8],
+        config: &ExecConfig,
+    ) -> Result<InteractiveHandle, SealError> {
+        let (stdin_read, stdin_write) =
+            pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+        let (stdout_read, stdout_write) =
+            pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+        let (stderr_read, stderr_write) =
+            pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+
+        let fork_result = unsafe { fork() }.map_err(|err| match err {
+            Errno::EAGAIN => {
+                SealError::InvalidInput("fork failed: EAGAIN (process limit reached)".to_string())
+            }
+            Errno::ENOMEM => {
+                SealError::InvalidInput("fork failed: ENOMEM (out of memory)".to_string())
+            }
+            other => SealError::Io(std::io::Error::from(other)),
+        })?;
+
+        match fork_result {
+            ForkResult::Child => {
+                drop(stdin_write);
+                drop(stdout_read);
+                drop(stderr_read);
+
+                unsafe {
+                    if nix::libc::dup2(stdin_read.as_raw_fd(), nix::libc::STDIN_FILENO) == -1 {
+                        nix::libc::_exit(127);
+                    }
+                    if nix::libc::dup2(stdout_write.as_raw_fd(), nix::libc::STDOUT_FILENO) == -1 {
+                        nix::libc::_exit(127);
+                    }
+                    if nix::libc::dup2(stderr_write.as_raw_fd(), nix::libc::STDERR_FILENO) == -1 {
+                        nix::libc::_exit(127);
+                    }
+                }
+
+                drop(stdin_read);
+                drop(stdout_write);
+                drop(stderr_write);
+
+                if let Some(cwd) = &config.cwd
+                    && let Err(err) = std::env::set_current_dir(cwd)
+                {
+                    eprintln!("failed to set cwd: {err}");
+                    unsafe {
+                        nix::libc::_exit(127);
+                    }
+                }
+
+                let exec_result = (|| -> Result<(), SealError> {
+                    let fd = self.ops.create_memfd("agent-seal-payload")?;
+                    for chunk in binary_data.chunks(65_536) {
+                        self.ops.write_chunk(&fd, chunk)?;
+                    }
+                    self.ops.seal_memfd(&fd)?;
+                    let argv = build_argv(config)?;
+                    let envp = build_envp(config)?;
+                    self.ops.exec_memfd(&fd, &argv, &envp)
+                })();
+
+                if let Err(err) = exec_result {
+                    eprintln!("memfd execution failed: {err}");
+                }
+                std::process::exit(127);
+            }
+            ForkResult::Parent { child } => {
+                drop(stdin_read);
+                drop(stdin_write);
+                drop(stdout_write);
+                drop(stderr_write);
+
+                let stdout = Arc::new(Mutex::new(Vec::new()));
+                let stderr = Arc::new(Mutex::new(Vec::new()));
+                let stdout_buffer = Arc::clone(&stdout);
+                let stderr_buffer = Arc::clone(&stderr);
+
+                let stdout_thread = std::thread::spawn(move || {
+                    read_fd_to_buffer(stdout_read, stdout_buffer, "stdout")
+                });
+                let stderr_thread = std::thread::spawn(move || {
+                    read_fd_to_buffer(stderr_read, stderr_buffer, "stderr")
+                });
+
+                Ok(InteractiveHandle {
+                    child_pid: child,
+                    stdout,
+                    stderr,
+                    stdout_thread,
+                    stderr_thread,
                 })
             }
         }
@@ -269,6 +406,21 @@ fn read_fd_to_string(fd: OwnedFd) -> Result<String, SealError> {
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn read_fd_to_buffer(
+    fd: OwnedFd,
+    buffer: Arc<Mutex<Vec<u8>>>,
+    stream_name: &'static str,
+) -> Result<(), SealError> {
+    let mut file = std::fs::File::from(fd);
+    let mut local = Vec::new();
+    file.read_to_end(&mut local)?;
+    *buffer
+        .lock()
+        .map_err(|_| SealError::InvalidInput(format!("{stream_name} buffer mutex poisoned")))? =
+        local;
+    Ok(())
 }
 
 fn extract_exit_code(status: WaitStatus) -> i32 {
@@ -700,6 +852,31 @@ mod tests {
             .exec_memfd(&read_fd, &argv, &envp)
             .expect_err("pipe fd cannot be executed");
         assert!(matches!(err, SealError::Io(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_runs_linux_payloads() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let cases = [
+            ("/bin/true", vec!["true"], 0, ""),
+            ("/bin/false", vec!["false"], 1, ""),
+            ("/bin/sh", vec!["sh", "-c", "echo hi"], 0, "hi\n"),
+        ];
+
+        for (path, args, expected_exit, expected_stdout) in cases {
+            let payload = std::fs::read(path).unwrap();
+            let config = ExecConfig {
+                args: args.into_iter().map(str::to_string).collect(),
+                env: Vec::new(),
+                cwd: None,
+            };
+
+            let handle = executor.execute_interactive(&payload, &config).unwrap();
+            let result = handle.wait().unwrap();
+            assert_eq!(result.exit_code, expected_exit);
+            assert_eq!(result.stdout, expected_stdout);
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
