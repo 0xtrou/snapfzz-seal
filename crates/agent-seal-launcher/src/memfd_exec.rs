@@ -1059,9 +1059,9 @@ mod tests {
     #[test]
     fn execute_interactive_enforces_max_lifetime() {
         let executor = MemfdExecutor::new(KernelMemfdOps);
-        let payload = std::fs::read("/bin/cat").unwrap();
+        let payload = std::fs::read("/bin/sleep").unwrap();
         let config = ExecConfig {
-            args: vec!["cat".into()],
+            args: vec!["sleep".into(), "30".into()],
             env: Vec::new(),
             cwd: None,
             max_lifetime_secs: Some(1),
@@ -1069,7 +1069,15 @@ mod tests {
         };
 
         let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let start = std::time::Instant::now();
         let result = handle.wait().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "should have been killed by lifetime, not waited full 30s: {:?}",
+            elapsed
+        );
         assert_ne!(result.exit_code, 0);
     }
 
