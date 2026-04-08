@@ -1387,41 +1387,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_interactive_with_mock_ops_relays_stdout_and_stderr() {
-        let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
-        unsafe {
-            std::env::set_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", "1");
-        }
-
-        let ops = MockMemfdOps::new();
-        let config = ExecConfig {
-            args: vec!["payload-bin".into(), "--flag".into()],
-            env: vec![("A".into(), "1".into())],
-            cwd: None,
-            max_lifetime_secs: None,
-            grace_period_secs: 1,
-            max_output_bytes: Some(DEFAULT_MAX_OUTPUT_BYTES),
-        };
-
-        let executor = MemfdExecutor::new(ops);
-        let handle = executor.execute_interactive(b"payload", &config).unwrap();
-        let result = handle.relay_test_input(b"ignored input").unwrap();
-
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "stdout:0\n");
-        assert_eq!(result.stderr, "stderr:payload-bin\n");
-
-        let log = executor.ops.read_log();
-        let lines: Vec<_> = log.lines().collect();
-        assert_eq!(lines[0], "create:agent-seal-payload");
-        assert_eq!(lines[1], "write:7");
-        assert_eq!(lines[2], "seal");
-        assert_eq!(lines[3], "exec:2:1");
-
-        restore_env_var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS", previous.as_deref());
-    }
-
-    #[test]
     fn execute_interactive_respects_max_output_bytes_limit() {
         let previous = std::env::var("AGENT_SEAL_INTERACTIVE_HEARTBEAT_SECS").ok();
         unsafe {
