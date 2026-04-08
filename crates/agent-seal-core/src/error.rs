@@ -14,6 +14,8 @@ pub enum SealError {
     TamperDetected,
     #[error("fingerprint mismatch: sandbox environment changed")]
     FingerprintMismatch,
+    #[error("invalid signature")]
+    InvalidSignature,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid input: {0}")]

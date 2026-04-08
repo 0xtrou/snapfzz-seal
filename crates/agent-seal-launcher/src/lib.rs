@@ -12,6 +12,7 @@ use agent_seal_core::{
     derive::{derive_env_key, derive_session_key},
     error::SealError,
     payload::{read_footer, unpack_payload, validate_payload_header},
+    signing,
     types::{
         LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER, LAUNCHER_TAMPER_MARKER, PayloadFooter,
     },
@@ -23,6 +24,9 @@ use clap::{Parser, ValueEnum};
 pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
+
+const SIG_MAGIC: &[u8; 4] = b"ASL\x02";
+const SIG_BLOCK_SIZE: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum FingerprintMode {
@@ -44,9 +48,37 @@ pub struct Cli {
     pub verbose: bool,
 }
 
+fn verify_signature(payload_bytes: &[u8]) -> Result<(), SealError> {
+    if payload_bytes.len() < SIG_BLOCK_SIZE {
+        return Ok(());
+    }
+    let sig_start = payload_bytes.len() - SIG_BLOCK_SIZE;
+    if &payload_bytes[sig_start..sig_start + 4] != SIG_MAGIC {
+        return Ok(());
+    }
+
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&payload_bytes[sig_start + 4..sig_start + 68]);
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&payload_bytes[sig_start + 68..sig_start + 100]);
+    let data = &payload_bytes[..sig_start];
+
+    match signing::verify(&pubkey, data, &signature)? {
+        true => {
+            tracing::info!(
+                pubkey_fingerprint = %hex::encode(&pubkey[..16]),
+                "signature verified"
+            );
+            Ok(())
+        }
+        false => Err(SealError::InvalidSignature),
+    }
+}
+
 pub fn run(cli: Cli) -> Result<(), SealError> {
     let payload_bytes = load_payload_bytes(cli.payload.as_deref())?;
     validate_payload_header(&payload_bytes)?;
+    verify_signature(&payload_bytes)?;
     let _footer = extract_footer(&payload_bytes).map_err(|_| {
         SealError::InvalidPayload("missing or corrupted payload footer".to_string())
     })?;
@@ -153,6 +185,7 @@ pub fn format_user_error(err: &SealError) -> String {
         SealError::FingerprintMismatch => {
             "ERROR: fingerprint mismatch — sandbox environment has changed".to_string()
         }
+        SealError::InvalidSignature => "ERROR: invalid signature".to_string(),
         SealError::Io(msg) => format!("ERROR: IO failure: {msg}"),
         SealError::InvalidInput(msg) => format!("ERROR: invalid input: {msg}"),
         SealError::CompilationError(msg) => format!("ERROR: compilation error: {msg}"),

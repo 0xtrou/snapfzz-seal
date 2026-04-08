@@ -8,8 +8,16 @@ pub struct Cli {
     pub fingerprint_mode: FingerprintMode,
     #[arg(long)]
     pub user_fingerprint: Option<String>,
+    #[arg(long, value_enum, default_value_t = LaunchMode::Batch)]
+    pub mode: LaunchMode,
     #[arg(long)]
     pub verbose: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum LaunchMode {
+    Batch,
+    Interactive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -33,7 +41,7 @@ pub fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, FingerprintMode, run};
+    use super::{Cli, FingerprintMode, LaunchMode, run};
     use clap::Parser;
 
     #[derive(Parser)]
@@ -47,6 +55,7 @@ mod tests {
             payload: Some("/definitely/missing/payload.asl".to_string()),
             fingerprint_mode: mode,
             user_fingerprint: None,
+            mode: LaunchMode::Batch,
             verbose: false,
         }
     }
@@ -71,6 +80,8 @@ mod tests {
             "session",
             "--user-fingerprint",
             "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+            "--mode",
+            "interactive",
             "--verbose",
         ]);
 
@@ -79,6 +90,7 @@ mod tests {
             parsed.cli.user_fingerprint.as_deref(),
             Some("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
         );
+        assert_eq!(parsed.cli.mode, LaunchMode::Interactive);
         assert!(parsed.cli.verbose);
     }
 
