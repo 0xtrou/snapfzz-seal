@@ -6,7 +6,7 @@
 
 Agent Seal is an encrypted, sandbox-bound agent delivery system for Linux. It compiles agents into sealed payloads, binds decryption to runtime fingerprints, executes from memory, and avoids shipping API keys in delivered binaries.
 
-The primary interface is a single binary, `seal`, with seven subcommands:
+The primary interface is a single binary, `seal`, with six subcommands:
 
 - `seal compile`: compile and seal an agent payload
 - `seal launch`: launch a sealed agent payload
@@ -14,7 +14,6 @@ The primary interface is a single binary, `seal`, with seven subcommands:
 - `seal sign`: sign a sealed binary with a builder key
 - `seal verify`: verify a sealed binary signature
 - `seal server`: start the orchestration API server
-- `seal proxy`: start the LLM access proxy
 
 ## Architecture
 
@@ -24,20 +23,20 @@ The primary interface is a single binary, `seal`, with seven subcommands:
                               │   single CLI binary     │
                               └──────────┬──────────────┘
                                          │
-        ┌────────────────────────────────┼────────────────────────────────┐
-        │                                │                                │
-┌───────▼────────┐             ┌─────────▼────────┐             ┌─────────▼────────┐
-│  seal server   │             │  seal compile    │             │   seal proxy     │
-│ orchestration  │             │ compile + seal   │             │  LLM access      │
-│ API entrypoint │             │ pipeline         │             │  proxy           │
-└───────┬────────┘             └─────────┬────────┘             └─────────┬────────┘
-        │                                │                                │
-        │                      ┌─────────▼────────┐                       │
-        │                      │  seal launch     │                       │
-        │                      │ decrypt + exec   │                       │
-        │                      │ from memfd       │                       │
-        │                      └─────────┬────────┘                       │
-        │                                │                                │
+         ┌────────────────────────────────┼────────────────────────────────┐
+         │                                │                                │
+┌───────▼────────┐             ┌─────────▼────────┐
+│  seal server   │             │  seal compile    │
+│ orchestration  │             │ compile + seal   │
+│ API entrypoint │             │ pipeline         │
+└───────┬────────┘             └─────────┬────────┘
+        │                                │
+        │                      ┌─────────▼────────┐
+        │                      │  seal launch     │
+        │                      │ decrypt + exec   │
+        │                      │ from memfd       │
+        │                      └─────────┬────────┘
+        │                                │
         │                ┌───────────────▼───────────────┐                │
         │                │      builder signing flow      │                │
         │                └───────┬─────────┬──────────────┘                │
@@ -134,12 +133,11 @@ In short: Agent Seal raises attacker cost and narrows abuse windows; it is not a
 
 | Crate | Type | Role |
 |---|---|---|
-| `agent-seal` | bin | Umbrella CLI that provides `seal compile`, `seal launch`, `seal keygen`, `seal sign`, `seal verify`, `seal server`, and `seal proxy` |
+| `agent-seal` | bin | Umbrella CLI that provides `seal compile`, `seal launch`, `seal keygen`, `seal sign`, `seal verify`, and `seal server` |
 | `agent-seal-core` | lib | Shared types, crypto boundaries, payload metadata, derivation primitives, and Ed25519 signing primitives |
 | `agent-seal-fingerprint` | lib | Fingerprint collection, canonicalization, mismatch detection |
 | `agent-seal-launcher` | bin | Runtime launcher for decrypt and execution flow (Linux only) |
 | `agent-seal-compiler` | lib + bin | Build and seal pipeline, backend adapters (`nuitka`, `pyinstaller`) |
-| `agent-seal-proxy` | lib + bin | LLM provider proxy with auth, rate limiting, and SSE streaming (deprecated in v0.2, retained for dev-only use) |
 | `agent-seal-server` | bin | Orchestration API that composes compile, dispatch, and job management |
 
 ## Installation
@@ -181,13 +179,7 @@ seal launch --payload ./out/payload.asl --fingerprint-mode stable --user-fingerp
 seal server --bind 0.0.0.0:9090 --compile-dir ./.agent-seal/compile --output-dir ./.agent-seal/output
 ```
 
-### Run LLM proxy
-
-```bash
-seal proxy --provider-key "$OPENAI_API_KEY" --provider openai --bind 0.0.0.0:8080
-```
-
-### Builder signing workflow
+### Run orchestration server
 
 ```bash
 # 1. Generate a signing keypair (one-time per builder)
@@ -495,101 +487,6 @@ curl http://127.0.0.1:9090/api/v1/jobs/job-.../results
 
 ---
 
-### `seal proxy` — LLM access proxy
-
-> **Deprecated in v0.2**: `seal proxy` is retained as an optional development tool. Enterprise deployments should use BYOK/BYOE patterns (bring-your-own-key/endpoint) instead.
-
-Starts an LLM proxy that holds provider API keys server-side. Agents authenticate with virtual keys and never see real credentials. Supports OpenAI and Anthropic providers, SSE streaming, and per-key rate limiting.
-
-```text
-Usage: seal proxy [OPTIONS] --provider-key <PROVIDER_KEY>
-Options:
-  --provider-key <KEY>            Upstream provider API key
-  --provider <NAME>               Provider name [default: openai] (openai | anthropic)
-  --bind <ADDR>                   Listen address [default: 0.0.0.0:8080]
-```
-
-#### Proxy API Routes
-
-| Method | Route | Auth | Description |
-|--------|-------|------|-------------|
-| GET | `/health` | none | Health check |
-| POST | `/v1/chat/completions` | virtual key | OpenAI-compatible chat completions |
-| POST | `/admin/keys` | admin token | Create a virtual key |
-| GET | `/admin/keys` | admin token | List all virtual keys |
-| DELETE | `/admin/keys/{key_id}` | admin token | Revoke a virtual key |
-| GET | `/_test/authenticated` | virtual key | Test auth (returns 200 if valid) |
-
-**Admin auth** is via `Authorization: Bearer <AGENT_SEAL_ADMIN_TOKEN>`. The `AGENT_SEAL_ADMIN_TOKEN` environment variable is required.
-
-**Virtual key auth** is via `Authorization: Bearer as-...` (keys created via `/admin/keys`).
-
-#### Create a virtual key
-
-```bash
-curl -X POST http://127.0.0.1:8080/admin/keys \
-  -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"sandbox_id":"my-sandbox","ttl_secs":3600}'
-```
-
-Response `201 Created`:
-```json
-{
-  "id": "vk_a1b2c3d4e5f6a7b8",
-  "key": "as-AbCdEf0123456789..."
-}
-```
-
-The `key` field is the full key — it is only returned once at creation time. Store it securely.
-
-#### Chat completions (compatible with OpenAI SDK)
-
-```bash
-curl -X POST http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer as-AbCdEf0123456789..." \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "gpt-4o-mini",
-    "messages": [{"role": "user", "content": "Hello"}],
-    "stream": false,
-    "max_tokens": 128
-  }'
-```
-
-Streaming works the same way — set `"stream": true` and the proxy forwards the SSE stream from the upstream provider.
-
-**Examples:**
-
-```bash
-# Start proxy with OpenAI
-seal proxy --provider-key "$OPENAI_API_KEY" --provider openai --bind 127.0.0.1:8080
-
-# Start proxy with Anthropic
-seal proxy --provider-key "$ANTHROPIC_API_KEY" --provider anthropic --bind 127.0.0.0:9090
-
-# Create a virtual key for a sandbox
-KEY_RESPONSE=$(curl -s -X POST http://127.0.0.1:8080/admin/keys \
-  -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"sandbox_id":"prod-sbx","ttl_secs":86400}')
-VIRTUAL_KEY=$(echo "$KEY_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])')
-
-# Use the virtual key from an agent
-curl -X POST http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $VIRTUAL_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":"Say hello"}]}'
-
-# List all keys
-curl -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" http://127.0.0.1:8080/admin/keys
-
-# Revoke a key
-curl -X DELETE -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" http://127.0.0.1:8080/admin/keys/vk_a1b2c3d4
-```
-
----
-
 ## Configuration
 
 ### Environment variables
@@ -597,7 +494,6 @@ curl -X DELETE -H "Authorization: Bearer $AGENT_SEAL_ADMIN_TOKEN" http://127.0.0
 | Variable | Component | Description |
 |----------|-----------|-------------|
 | `AGENT_SEAL_MASTER_SECRET_HEX` | launch | 64-hex master secret for HKDF key derivation |
-| `AGENT_SEAL_ADMIN_TOKEN` | proxy | Required bearer token for admin key management APIs (no default) |
 | `AGENT_SEAL_LAUNCHER_PATH` | compile | Path to launcher binary (alternative to `--launcher`) |
 | `AGENT_SEAL_LAUNCHER_SIZE` | launch | Launcher binary size (for self-extraction) |
 | `RUST_LOG` | all | Tracing level/filter (e.g. `debug`, `info`, `agent_seal=trace`) |

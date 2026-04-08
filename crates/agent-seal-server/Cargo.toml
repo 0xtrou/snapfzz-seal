@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 agent-seal-core = { path = "../agent-seal-core" }
 agent-seal-compiler = { path = "../agent-seal-compiler" }
-agent-seal-proxy = { path = "../agent-seal-proxy" }
 agent-seal-fingerprint = { path = "../agent-seal-fingerprint" }
 axum = { workspace = true }
 axum-extra = { workspace = true }

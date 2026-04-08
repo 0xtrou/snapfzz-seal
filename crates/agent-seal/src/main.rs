@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 mod compile;
 mod keygen;
 mod launch;
-mod proxy;
 mod server;
 mod sign;
 mod verify;
@@ -23,7 +22,6 @@ enum Command {
     Keygen(keygen::Cli),
     Launch(launch::Cli),
     Server(server::Cli),
-    Proxy(proxy::Cli),
     Sign(sign::Cli),
     Verify(verify::Cli),
 }
@@ -39,7 +37,6 @@ fn main() {
         Command::Keygen(cli) => keygen::run(cli),
         Command::Launch(cli) => launch::run(cli),
         Command::Server(cli) => server::run(cli),
-        Command::Proxy(cli) => proxy::run(cli),
         Command::Sign(cli) => sign::run(cli),
         Command::Verify(cli) => verify::run(cli),
     };

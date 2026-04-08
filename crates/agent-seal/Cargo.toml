@@ -14,7 +14,6 @@ path = "src/main.rs"
 agent-seal-core = { path = "../agent-seal-core" }
 agent-seal-compiler = { path = "../agent-seal-compiler" }
 agent-seal-launcher = { path = "../agent-seal-launcher" }
-agent-seal-proxy = { path = "../agent-seal-proxy" }
 agent-seal-server = { path = "../agent-seal-server" }
 agent-seal-fingerprint = { path = "../agent-seal-fingerprint" }
 clap = { workspace = true, features = ["derive"] }
