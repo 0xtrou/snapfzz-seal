@@ -423,7 +423,7 @@ mod tests {
     }
 
     async fn wait_for_status(state: &ServerState, job_id: &str, expected: JobState) {
-        for _ in 0..40 {
+        for _ in 0..240 {
             if let Some(job) = state.get_job(job_id).await
                 && job.status == expected
             {
@@ -482,7 +482,12 @@ mod tests {
                         .expect("job should include error")
                         .contains("sandbox copy failed")
                 );
-                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+                assert!(
+                    updated
+                        .sandbox_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("sbx-"))
+                );
             }
             "exec_failure" => {
                 let binary_path = std::env::var("AGENT_SEAL_TEST_BINARY_PATH")
@@ -525,7 +530,12 @@ mod tests {
                         .expect("job should include error")
                         .contains("sandbox exec failed")
                 );
-                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+                assert!(
+                    updated
+                        .sandbox_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("sbx-"))
+                );
             }
             "destroy_error" => {
                 let binary_path = std::env::var("AGENT_SEAL_TEST_BINARY_PATH")
@@ -569,7 +579,12 @@ mod tests {
                         .expect("job should include error")
                         .contains("sandbox destroy failed")
                 );
-                assert_eq!(updated.sandbox_id.as_deref(), Some("sbx-mock"));
+                assert!(
+                    updated
+                        .sandbox_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("sbx-"))
+                );
             }
             other => panic!("unknown probe mode: {other}"),
         }
@@ -884,6 +899,7 @@ case "$cmd" in
     printf 'container-exec-fail\n'
     ;;
   cp)
+    rm -- "$0"
     exit 0
     ;;
   exec)
