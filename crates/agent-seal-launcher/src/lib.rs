@@ -132,6 +132,8 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         args: Vec::new(),
         env: Vec::new(),
         cwd: None,
+        max_lifetime_secs: None,
+        grace_period_secs: 30,
     };
 
     let result = executor.execute(decrypted.as_slice(), &config)?;

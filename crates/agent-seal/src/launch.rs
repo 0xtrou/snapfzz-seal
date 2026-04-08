@@ -12,6 +12,10 @@ pub struct Cli {
     pub mode: LaunchMode,
     #[arg(long)]
     pub verbose: bool,
+    #[arg(long)]
+    pub max_lifetime: Option<u64>,
+    #[arg(long, default_value_t = 30)]
+    pub grace_period: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -57,6 +61,8 @@ mod tests {
             user_fingerprint: None,
             mode: LaunchMode::Batch,
             verbose: false,
+            max_lifetime: None,
+            grace_period: 30,
         }
     }
 
@@ -92,6 +98,30 @@ mod tests {
         );
         assert_eq!(parsed.cli.mode, LaunchMode::Interactive);
         assert!(parsed.cli.verbose);
+    }
+
+    #[test]
+    fn cli_accepts_lifetime_flags() {
+        let parsed = ParseCli::parse_from([
+            "test",
+            "--payload",
+            "./payload.asl",
+            "--max-lifetime",
+            "3600",
+            "--grace-period",
+            "60",
+        ]);
+
+        assert_eq!(parsed.cli.max_lifetime, Some(3600));
+        assert_eq!(parsed.cli.grace_period, 60);
+    }
+
+    #[test]
+    fn cli_defaults_grace_period_to_30() {
+        let parsed = ParseCli::parse_from(["test", "--payload", "./payload.asl"]);
+
+        assert_eq!(parsed.cli.max_lifetime, None);
+        assert_eq!(parsed.cli.grace_period, 30);
     }
 
     #[test]

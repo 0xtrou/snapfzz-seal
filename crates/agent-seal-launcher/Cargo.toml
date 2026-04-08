@@ -10,7 +10,7 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 memfd = { workspace = true }
-nix = { workspace = true, features = ["process", "fs", "sched", "ptrace"] }
+nix = { workspace = true, features = ["process", "fs", "sched", "signal", "ptrace"] }
 zeroize = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }

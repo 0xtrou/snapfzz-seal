@@ -3,9 +3,11 @@ use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use agent_seal_core::{error::SealError, types::ExecutionResult};
 use nix::errno::Errno;
+use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, fork, pipe};
 
@@ -31,6 +33,8 @@ pub struct ExecConfig {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub cwd: Option<String>,
+    pub max_lifetime_secs: Option<u64>,
+    pub grace_period_secs: u64,
 }
 
 pub struct InteractiveHandle {
@@ -39,6 +43,10 @@ pub struct InteractiveHandle {
     stderr: Arc<Mutex<Vec<u8>>>,
     stdout_thread: JoinHandle<Result<(), SealError>>,
     stderr_thread: JoinHandle<Result<(), SealError>>,
+    max_lifetime: Option<Duration>,
+    grace_period: Duration,
+    start_time: Instant,
+    signal_thread: Option<JoinHandle<()>>,
 }
 
 impl InteractiveHandle {
@@ -50,8 +58,40 @@ impl InteractiveHandle {
             .join()
             .map_err(|_| SealError::InvalidInput("stderr reader thread panicked".to_string()))??;
 
+        if let Some(ref max) = self.max_lifetime {
+            let elapsed = self.start_time.elapsed();
+            if elapsed >= *max {
+                tracing::warn!(
+                    "agent exceeded max lifetime ({:?} >= {:?}), sending SIGTERM",
+                    elapsed,
+                    max
+                );
+                let _ = signal::kill(self.child_pid, Signal::SIGTERM);
+
+                let deadline = Instant::now() + self.grace_period;
+                loop {
+                    match waitpid(self.child_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)) => break,
+                        Ok(_) => {
+                            if Instant::now() >= deadline {
+                                tracing::warn!("grace period expired, sending SIGKILL");
+                                let _ = signal::kill(self.child_pid, Signal::SIGKILL);
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
         let wait_status = waitpid(self.child_pid, None)
             .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
+
+        if let Some(signal_thread) = self.signal_thread {
+            let _ = signal_thread.join();
+        }
 
         let stdout = self
             .stdout
@@ -67,6 +107,30 @@ impl InteractiveHandle {
             stdout: String::from_utf8_lossy(stdout.as_slice()).into_owned(),
             stderr: String::from_utf8_lossy(stderr.as_slice()).into_owned(),
         })
+    }
+
+    fn spawn_signal_forwarder() -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let sa = signal::SigAction::new(
+                signal::SigHandler::Handler(handler_forward_signal),
+                signal::SaFlags::SA_RESTART,
+                signal::SigSet::empty(),
+            );
+            let _ = unsafe { signal::sigaction(Signal::SIGTERM, &sa) };
+            let _ = unsafe { signal::sigaction(Signal::SIGINT, &sa) };
+            std::thread::sleep(Duration::from_secs(86400));
+        })
+    }
+}
+
+static FORWARD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn handler_forward_signal(sig: std::ffi::c_int) {
+    let pid = FORWARD_PID.load(std::sync::atomic::Ordering::Relaxed);
+    if pid != 0 {
+        unsafe {
+            nix::libc::kill(pid, sig);
+        }
     }
 }
 
@@ -250,12 +314,21 @@ impl<Ops: MemfdOps> MemfdExecutor<Ops> {
                     read_fd_to_buffer(stderr_read, stderr_buffer, "stderr")
                 });
 
+                let signal_thread = {
+                    FORWARD_PID.store(child.as_raw(), std::sync::atomic::Ordering::Relaxed);
+                    Some(InteractiveHandle::spawn_signal_forwarder())
+                };
+
                 Ok(InteractiveHandle {
                     child_pid: child,
                     stdout,
                     stderr,
                     stdout_thread,
                     stderr_thread,
+                    max_lifetime: config.max_lifetime_secs.map(Duration::from_secs),
+                    grace_period: Duration::from_secs(config.grace_period_secs),
+                    start_time: Instant::now(),
+                    signal_thread,
                 })
             }
         }
@@ -550,6 +623,8 @@ mod tests {
             args: vec!["payload-bin".into(), "--flag".into()],
             env: vec![("A".into(), "1".into())],
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -574,6 +649,8 @@ mod tests {
             args: vec!["payload-bin".into()],
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -595,6 +672,8 @@ mod tests {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let argv = build_argv(&config).unwrap();
@@ -608,6 +687,8 @@ mod tests {
             args: vec!["payload-bin".into(), "--flag".into(), "value".into()],
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let argv = build_argv(&config).unwrap();
@@ -631,6 +712,8 @@ mod tests {
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let envp = build_envp(&config).unwrap();
@@ -650,6 +733,8 @@ mod tests {
                 ("B".to_string(), "two".to_string()),
             ],
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let envp = build_envp(&config).unwrap();
@@ -684,6 +769,8 @@ mod tests {
             args: vec!["payload-bin".into()],
             env: vec![("A".into(), "1".into())],
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -725,6 +812,8 @@ mod tests {
             args: vec!["payload-bin".into()],
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let result = executor.execute(b"payload", &config).unwrap();
@@ -739,6 +828,8 @@ mod tests {
             args: vec!["payload-bin".into()],
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let executor = MemfdExecutor::new(ops);
@@ -756,6 +847,8 @@ mod tests {
             args: vec!["ok".into(), "bad\0arg".into()],
             env: Vec::new(),
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let err = build_argv(&config).expect_err("NUL argument must fail");
@@ -771,6 +864,8 @@ mod tests {
                 ("B".into(), "bad\0value".into()),
             ],
             cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
         };
 
         let err = build_envp(&config).expect_err("NUL env value must fail");
@@ -870,6 +965,8 @@ mod tests {
                 args: args.into_iter().map(str::to_string).collect(),
                 env: Vec::new(),
                 cwd: None,
+                max_lifetime_secs: None,
+                grace_period_secs: 30,
             };
 
             let handle = executor.execute_interactive(&payload, &config).unwrap();
@@ -908,5 +1005,67 @@ mod tests {
 
         drop(read_fd);
         drop(write_fd);
+    }
+
+    #[test]
+    fn exec_config_defaults_no_lifetime() {
+        let config = ExecConfig {
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: None,
+            grace_period_secs: 30,
+        };
+        assert!(config.max_lifetime_secs.is_none());
+        assert_eq!(config.grace_period_secs, 30);
+    }
+
+    #[test]
+    fn exec_config_stores_lifetime_settings() {
+        let config = ExecConfig {
+            args: Vec::new(),
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: Some(3600),
+            grace_period_secs: 60,
+        };
+        assert_eq!(config.max_lifetime_secs, Some(3600));
+        assert_eq!(config.grace_period_secs, 60);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_enforces_max_lifetime() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/sleep").unwrap();
+        let config = ExecConfig {
+            args: vec!["sleep".into(), "60".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: Some(1),
+            grace_period_secs: 1,
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.wait().unwrap();
+        assert_ne!(result.exit_code, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execute_interactive_allows_completion_within_lifetime() {
+        let executor = MemfdExecutor::new(KernelMemfdOps);
+        let payload = std::fs::read("/bin/true").unwrap();
+        let config = ExecConfig {
+            args: vec!["true".into()],
+            env: Vec::new(),
+            cwd: None,
+            max_lifetime_secs: Some(300),
+            grace_period_secs: 30,
+        };
+
+        let handle = executor.execute_interactive(&payload, &config).unwrap();
+        let result = handle.wait().unwrap();
+        assert_eq!(result.exit_code, 0);
     }
 }
