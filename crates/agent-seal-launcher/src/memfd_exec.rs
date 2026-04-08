@@ -1420,9 +1420,21 @@ mod tests {
         assert!(matches!(err, SealError::Io(_)));
     }
 
+    /// Returns true if the runtime supports memfd_create (CI sandboxes may block it).
+    #[cfg(target_os = "linux")]
+    fn can_create_memfd() -> bool {
+        memfd::MemfdOptions::new()
+            .create("agent-seal-probe")
+            .is_ok()
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_creates_child_process() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/true").unwrap();
         let config = ExecConfig {
@@ -1443,6 +1455,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_relays_output() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/echo").unwrap();
         let config = ExecConfig {
@@ -1464,6 +1480,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_captures_stderr() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/sh").unwrap();
         let config = ExecConfig {
@@ -1484,6 +1504,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_returns_exit_code() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/false").unwrap();
         let config = ExecConfig {
@@ -1503,6 +1527,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_accepts_stdin() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/cat").unwrap();
         let config = ExecConfig {
@@ -1523,6 +1551,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_enforces_max_lifetime() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/sleep").unwrap();
         let config = ExecConfig {
@@ -1546,6 +1578,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn execute_interactive_allows_completion_within_lifetime() {
+        if !can_create_memfd() {
+            eprintln!("skipping: memfd_create unavailable in this environment");
+            return;
+        }
         let executor = MemfdExecutor::new(KernelMemfdOps);
         let payload = std::fs::read("/bin/true").unwrap();
         let config = ExecConfig {
