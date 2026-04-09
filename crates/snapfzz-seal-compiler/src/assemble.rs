@@ -3,6 +3,10 @@ use sha2::{Digest, Sha256};
 use snapfzz_seal_core::{
     derive::derive_env_key,
     error::SealError,
+    integrity::{
+        compute_binary_integrity_hash, derive_key_with_integrity_from_binary,
+        find_integrity_regions,
+    },
     payload::{pack_payload_with_mode, write_footer},
     types::{AgentMode, LAUNCHER_PAYLOAD_SENTINEL, PayloadFooter},
 };
@@ -19,14 +23,12 @@ pub struct AssembleConfig {
 
 pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     let agent_elf_bytes = std::fs::read(&config.agent_elf_path)?;
-    let key = derive_env_key(
+    let env_key = derive_env_key(
         &config.master_secret,
         &config.stable_fingerprint_hash,
         &config.user_fingerprint,
     )?;
 
-    let encrypted_payload =
-        pack_payload_with_mode(Cursor::new(&agent_elf_bytes), &key, config.mode)?;
     let launcher_bytes = std::fs::read(&config.launcher_path)?;
 
     let launcher_with_secret = embed_master_secret(&launcher_bytes, &config.master_secret)?;
@@ -35,11 +37,16 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
     let launcher_with_tamper = embed_tamper_hash(&launcher_with_secret, &tamper_hash)?;
 
+    let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)?;
+
+    let encrypted_payload =
+        pack_payload_with_mode(Cursor::new(&agent_elf_bytes), &integrity_key, config.mode)?;
+
     let mut original_hash = [0_u8; 32];
     original_hash.copy_from_slice(&Sha256::digest(&agent_elf_bytes));
 
-    let mut launcher_hash = [0_u8; 32];
-    launcher_hash.copy_from_slice(&Sha256::digest(&launcher_with_tamper));
+    let regions = find_integrity_regions(&launcher_with_tamper)?;
+    let launcher_hash = compute_binary_integrity_hash(&launcher_with_tamper, &regions)?;
 
     let footer = PayloadFooter {
         original_hash,
@@ -65,10 +72,14 @@ mod tests {
     use super::*;
     use snapfzz_seal_core::{
         derive::derive_env_key,
+        integrity::{
+            compute_binary_integrity_hash, derive_key_with_integrity_from_binary,
+            find_integrity_regions,
+        },
         payload::{pack_payload_with_mode, read_footer, unpack_payload, write_footer},
         types::{
-            AgentMode, LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER, LAUNCHER_TAMPER_MARKER,
-            PayloadFooter,
+            AgentMode, LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_TAMPER_MARKER, PayloadFooter,
+            SHAMIR_TOTAL_SHARES, get_secret_marker,
         },
     };
     use std::io::Cursor;
@@ -79,9 +90,11 @@ mod tests {
 
     fn launcher_with_markers(fill: u8) -> Vec<u8> {
         let mut launcher = vec![fill; 256];
-        launcher.extend_from_slice(LAUNCHER_SECRET_MARKER);
-        launcher.extend_from_slice(&[0_u8; 32]);
-        launcher.extend_from_slice(&[fill; 64]);
+        for i in 0..SHAMIR_TOTAL_SHARES {
+            launcher.extend_from_slice(get_secret_marker(i));
+            launcher.extend_from_slice(&[0_u8; 32]);
+            launcher.extend_from_slice(&[fill; 12]);
+        }
         launcher.extend_from_slice(LAUNCHER_TAMPER_MARKER);
         launcher.extend_from_slice(&[0_u8; 32]);
         launcher.extend_from_slice(&[fill; 128]);
@@ -113,15 +126,26 @@ mod tests {
 
         let assembled = assemble(&config).expect("assembly should succeed");
 
-        let key = derive_env_key(
+        let env_key = derive_env_key(
             &config.master_secret,
             &config.stable_fingerprint_hash,
             &config.user_fingerprint,
         )
         .expect("key derivation should succeed");
-        let expected_payload =
-            pack_payload_with_mode(Cursor::new(agent_bytes.clone()), &key, AgentMode::Batch)
-                .expect("payload packing should succeed");
+        let launcher_with_secret =
+            embed_master_secret(&launcher_bytes, &config.master_secret).expect("secret embed");
+        let mut tamper_hash = [0_u8; 32];
+        tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
+        let launcher_with_tamper =
+            embed_tamper_hash(&launcher_with_secret, &tamper_hash).expect("tamper embed");
+        let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)
+            .expect("integrity key");
+        let expected_payload = pack_payload_with_mode(
+            Cursor::new(agent_bytes.clone()),
+            &integrity_key,
+            AgentMode::Batch,
+        )
+        .expect("payload packing should succeed");
 
         assert!(assembled.len() > launcher_bytes.len());
 
@@ -177,12 +201,23 @@ mod tests {
 
         let assembled = assemble(&config).expect("assembly should succeed");
 
-        let key = derive_env_key(&master_secret, &stable_fingerprint_hash, &user_fingerprint)
+        let env_key = derive_env_key(&master_secret, &stable_fingerprint_hash, &user_fingerprint)
             .expect("key derivation should succeed");
-        let payload_len =
-            pack_payload_with_mode(Cursor::new(agent_bytes.clone()), &key, AgentMode::Batch)
-                .expect("payload packing should succeed")
-                .len();
+        let launcher_with_secret =
+            embed_master_secret(&launcher_bytes, &master_secret).expect("secret embed");
+        let mut tamper_hash = [0_u8; 32];
+        tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
+        let launcher_with_tamper =
+            embed_tamper_hash(&launcher_with_secret, &tamper_hash).expect("tamper embed");
+        let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)
+            .expect("integrity key");
+        let payload_len = pack_payload_with_mode(
+            Cursor::new(agent_bytes.clone()),
+            &integrity_key,
+            AgentMode::Batch,
+        )
+        .expect("payload packing should succeed")
+        .len();
         let footer_len = 64;
         let payload_start = assembled.len() - payload_len - footer_len;
         assert_eq!(
@@ -191,8 +226,8 @@ mod tests {
         );
         let payload_section = &assembled[payload_start..payload_start + payload_len];
 
-        let (decrypted, _header) =
-            unpack_payload(Cursor::new(payload_section), &key).expect("payload should unpack");
+        let (decrypted, _header) = unpack_payload(Cursor::new(payload_section), &integrity_key)
+            .expect("payload should unpack");
 
         assert_eq!(decrypted, agent_bytes);
     }
@@ -259,7 +294,7 @@ mod tests {
         .expect_err("launcher without markers should fail embedding");
 
         assert!(
-            matches!(err, SealError::CompilationError(message) if message.contains("EmbedFailed: marker not found"))
+            matches!(err, SealError::CompilationError(message) if message.contains("EmbedFailed: marker 1 not found"))
         );
     }
 
@@ -288,21 +323,30 @@ mod tests {
         let assembled = assemble(&config).expect("assembly should succeed");
         let footer = read_footer(&assembled[assembled.len() - 64..]).expect("footer should parse");
 
-        let key = derive_env_key(
+        let env_key = derive_env_key(
             &config.master_secret,
             &config.stable_fingerprint_hash,
             &config.user_fingerprint,
         )
         .expect("key derivation should succeed");
+        let launcher_with_secret =
+            embed_master_secret(&launcher_bytes, &config.master_secret).expect("secret embed");
+        let mut tamper_hash = [0_u8; 32];
+        tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
+        let launcher_with_tamper =
+            embed_tamper_hash(&launcher_with_secret, &tamper_hash).expect("tamper embed");
+        let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)
+            .expect("integrity key");
         let encrypted_payload =
-            pack_payload_with_mode(Cursor::new(&agent_bytes), &key, AgentMode::Batch)
+            pack_payload_with_mode(Cursor::new(&agent_bytes), &integrity_key, AgentMode::Batch)
                 .expect("payload packing should succeed");
         let launcher_len =
             assembled.len() - LAUNCHER_PAYLOAD_SENTINEL.len() - encrypted_payload.len() - 64;
         let launcher_with_tamper = &assembled[..launcher_len];
 
-        let mut expected_launcher_hash = [0_u8; 32];
-        expected_launcher_hash.copy_from_slice(&Sha256::digest(launcher_with_tamper));
+        let regions = find_integrity_regions(launcher_with_tamper).expect("regions");
+        let expected_launcher_hash =
+            compute_binary_integrity_hash(launcher_with_tamper, &regions).expect("hash");
         assert_eq!(footer.launcher_hash, expected_launcher_hash);
     }
 

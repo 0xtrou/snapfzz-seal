@@ -1,6 +1,8 @@
 #![allow(unsafe_code)]
 
 #[allow(dead_code)]
+mod anti_analysis;
+#[allow(dead_code)]
 mod anti_debug;
 mod cleanup;
 mod memfd_exec;
@@ -8,19 +10,24 @@ mod protection;
 #[allow(dead_code)]
 mod self_delete;
 mod seccomp;
+#[cfg(test)]
+mod integrity;
 
 use std::io::Cursor;
 
 use clap::{Parser, ValueEnum};
 pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
-#[cfg(target_os = "linux")]
-use snapfzz_seal_core::tamper;
 use snapfzz_seal_core::{
     derive::{derive_env_key, derive_session_key},
     error::SealError,
+    integrity::derive_key_with_integrity_from_binary,
     payload::{read_footer, unpack_payload, validate_payload_header},
+    shamir::reconstruct_secret,
     signing,
-    types::{LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_SECRET_MARKER, PayloadFooter},
+    types::{
+        LAUNCHER_PAYLOAD_SENTINEL, PayloadFooter, SHAMIR_THRESHOLD, SHAMIR_TOTAL_SHARES,
+        get_secret_marker,
+    },
 };
 use snapfzz_seal_fingerprint::{
     FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
@@ -82,6 +89,7 @@ fn verify_signature(payload_bytes: &[u8]) -> Result<(), SealError> {
 
 pub fn run(cli: Cli) -> Result<(), SealError> {
     let payload_bytes = load_payload_bytes(cli.payload.as_deref())?;
+    let launcher_bytes_for_integrity = resolve_binary_for_integrity(cli.payload.as_deref())?;
     validate_payload_header(&payload_bytes)?;
     verify_signature(&payload_bytes)?;
     let footer = extract_footer(&payload_bytes).map_err(|_| {
@@ -92,6 +100,14 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
 
     let protections = protection::apply_protections()?;
     tracing::info!(?protections, "anti-debug protections evaluated");
+
+    if anti_analysis::is_being_analyzed() {
+        tracing::error!("analysis detected, aborting launcher execution");
+        return Err(SealError::InvalidInput(
+            "analysis environment detected, refusing to continue".to_string(),
+        ));
+    }
+    anti_analysis::poison_environment();
 
     let collector = FingerprintCollector::new();
     let snapshot = match cli.fingerprint_mode {
@@ -111,6 +127,7 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         &user_fingerprint,
         &snapshot,
         cli.fingerprint_mode,
+        &launcher_bytes_for_integrity,
     )?;
 
     let decrypted = Zeroizing::new(
@@ -154,15 +171,18 @@ fn derive_decryption_key(
     user_fingerprint: &[u8; 32],
     snapshot: &FingerprintSnapshot,
     fingerprint_mode: FingerprintMode,
+    binary_for_integrity: &[u8],
 ) -> Result<[u8; 32], SealError> {
     let stable_hash = canonicalize_stable(snapshot);
     let env_key = derive_env_key(master_secret, &stable_hash, user_fingerprint)?;
+    let integrity_bound_key =
+        derive_key_with_integrity_from_binary(&env_key, binary_for_integrity)?;
 
     if fingerprint_mode == FingerprintMode::Session {
         let ephemeral_hash = canonicalize_ephemeral(snapshot);
-        derive_session_key(&env_key, &ephemeral_hash)
+        derive_session_key(&integrity_bound_key, &ephemeral_hash)
     } else {
-        Ok(env_key)
+        Ok(integrity_bound_key)
     }
 }
 
@@ -304,6 +324,13 @@ fn decode_user_fingerprint(user_fingerprint_hex: Option<String>) -> Result<[u8; 
     Ok(out)
 }
 
+fn resolve_binary_for_integrity(payload_arg: Option<&str>) -> Result<Vec<u8>, SealError> {
+    match payload_arg {
+        Some(path) if !path.eq_ignore_ascii_case("self") => std::fs::read(path).map_err(Into::into),
+        _ => std::fs::read("/proc/self/exe").map_err(Into::into),
+    }
+}
+
 fn load_master_secret(payload_bytes: &[u8]) -> Result<[u8; 32], SealError> {
     if let Some(secret) = extract_embedded_master_secret(payload_bytes) {
         return Ok(secret);
@@ -313,59 +340,73 @@ fn load_master_secret(payload_bytes: &[u8]) -> Result<[u8; 32], SealError> {
 }
 
 fn extract_embedded_master_secret(payload_bytes: &[u8]) -> Option<[u8; 32]> {
-    let marker_offset = find_marker(payload_bytes, LAUNCHER_SECRET_MARKER)?;
-    let secret_offset = marker_offset + LAUNCHER_SECRET_MARKER.len();
-    let secret_end = secret_offset + 32;
+    let mut shares = Vec::with_capacity(SHAMIR_TOTAL_SHARES);
 
-    if payload_bytes.len() < secret_end {
-        tracing::warn!("embedded launcher secret marker found but secret bytes are truncated");
+    for i in 0..SHAMIR_TOTAL_SHARES {
+        let marker = get_secret_marker(i);
+        let Some(marker_offset) = find_marker(payload_bytes, marker) else {
+            tracing::warn!("embedded launcher secret marker {} missing", i + 1);
+            continue;
+        };
+
+        let share_offset = marker_offset + marker.len();
+        let share_end = share_offset + 32;
+        if payload_bytes.len() < share_end {
+            tracing::warn!("embedded launcher secret share {} is truncated", i + 1);
+            continue;
+        }
+
+        let mut share = [0_u8; 32];
+        share.copy_from_slice(&payload_bytes[share_offset..share_end]);
+        shares.push(((i + 1) as u8, share));
+    }
+
+    if shares.len() < SHAMIR_THRESHOLD {
+        tracing::warn!(
+            "not enough embedded shares found: have {}, need {}",
+            shares.len(),
+            SHAMIR_THRESHOLD
+        );
         return None;
     }
 
-    let mut secret = [0_u8; 32];
-    secret.copy_from_slice(&payload_bytes[secret_offset..secret_end]);
-
-    Some(secret)
+    reconstruct_secret(&shares, SHAMIR_THRESHOLD)
+        .map_err(|err| {
+            tracing::warn!("failed to reconstruct embedded master secret: {err}");
+            err
+        })
+        .ok()
 }
 
-#[cfg(target_os = "linux")]
 fn verify_launcher_integrity(
     expected_hash: &[u8; 32],
     payload_arg: Option<&str>,
 ) -> Result<(), SealError> {
-    let full_binary = match payload_arg {
-        Some(path) if !path.eq_ignore_ascii_case("self") => std::fs::read(path)?,
-        _ => std::fs::read("/proc/self/exe")?,
-    };
+    #[cfg(target_os = "linux")]
+    {
+        let full_binary = resolve_binary_for_integrity(payload_arg)?;
+        let regions = find_integrity_regions(&full_binary)?;
+        let launcher_hash = compute_binary_integrity_hash(&full_binary, &regions)?;
 
-    let sentinel_offset =
-        find_marker(&full_binary, LAUNCHER_PAYLOAD_SENTINEL).ok_or_else(|| {
-            SealError::InvalidInput(
-                "cannot find payload sentinel for launcher integrity check".to_string(),
-            )
-        })?;
-
-    let launcher_hash = tamper::compute_hash_of_bytes(&full_binary[..sentinel_offset]);
-
-    if launcher_hash == *expected_hash {
-        Ok(())
-    } else {
-        tracing::error!(
-            expected = %hex::encode(expected_hash),
-            actual = %hex::encode(launcher_hash),
-            "launcher integrity check failed"
-        );
-        Err(SealError::TamperDetected)
+        if launcher_hash == *expected_hash {
+            Ok(())
+        } else {
+            tracing::error!(
+                expected = %hex::encode(expected_hash),
+                actual = %hex::encode(launcher_hash),
+                "launcher integrity check failed"
+            );
+            Err(SealError::TamperDetected)
+        }
     }
-}
 
-#[cfg(not(target_os = "linux"))]
-fn verify_launcher_integrity(
-    _expected_hash: &[u8; 32],
-    _payload_arg: Option<&str>,
-) -> Result<(), SealError> {
-    tracing::warn!("launcher integrity verification is skipped on non-Linux platforms");
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = expected_hash;
+        let _ = payload_arg;
+        tracing::warn!("launcher integrity verification is skipped on non-Linux platforms");
+        Ok(())
+    }
 }
 
 fn load_master_secret_from_env() -> Result<[u8; 32], SealError> {
@@ -398,7 +439,8 @@ mod tests {
     use snapfzz_seal_core::{
         derive::{derive_env_key, derive_session_key},
         payload::write_footer,
-        types::PayloadFooter,
+        shamir::split_secret_with_rng,
+        types::{PayloadFooter, SHAMIR_THRESHOLD, SHAMIR_TOTAL_SHARES, get_secret_marker},
     };
     use snapfzz_seal_fingerprint::{
         FingerprintSnapshot, RuntimeKind, SourceValue, Stability, canonicalize_ephemeral,
@@ -441,9 +483,16 @@ mod tests {
         user_fingerprint: &[u8; 32],
         snapshot: &FingerprintSnapshot,
         fingerprint_mode: FingerprintMode,
+        binary_for_integrity: &[u8],
     ) -> [u8; 32] {
-        derive_decryption_key(master_secret, user_fingerprint, snapshot, fingerprint_mode)
-            .expect("launcher key derivation should succeed")
+        derive_decryption_key(
+            master_secret,
+            user_fingerprint,
+            snapshot,
+            fingerprint_mode,
+            binary_for_integrity,
+        )
+        .expect("launcher key derivation should succeed")
     }
 
     fn unique_temp_path(stem: &str) -> PathBuf {
@@ -452,6 +501,77 @@ mod tests {
             std::process::id(),
             TEMP_ID.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[derive(Clone)]
+    struct DeterministicRng {
+        state: u64,
+    }
+
+    impl DeterministicRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64_inner(&mut self) -> u64 {
+            self.state = self
+                .state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.state
+        }
+    }
+
+    impl rand::RngCore for DeterministicRng {
+        fn next_u32(&mut self) -> u32 {
+            self.next_u64_inner() as u32
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.next_u64_inner()
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            let mut offset = 0;
+            while offset < dest.len() {
+                let bytes = self.next_u64_inner().to_le_bytes();
+                let take = usize::min(8, dest.len() - offset);
+                dest[offset..offset + take].copy_from_slice(&bytes[..take]);
+                offset += take;
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    fn launcher_with_secret_slots(prefix_len: usize, slot_len: usize) -> Vec<u8> {
+        let mut launcher = vec![0xAA; prefix_len];
+        for i in 0..SHAMIR_TOTAL_SHARES {
+            launcher.extend_from_slice(get_secret_marker(i));
+            launcher.extend_from_slice(&vec![0_u8; slot_len]);
+            launcher.extend_from_slice(&[0xF0 + i as u8; 3]);
+        }
+        launcher
+    }
+
+    fn embed_secret_for_launcher(launcher: &[u8], secret: &[u8; 32]) -> Vec<u8> {
+        let mut rng = DeterministicRng::new(0x1234_5678_9ABC_DEF0);
+        let shares = split_secret_with_rng(secret, SHAMIR_THRESHOLD, SHAMIR_TOTAL_SHARES, &mut rng)
+            .expect("split should succeed");
+
+        let mut modified = launcher.to_vec();
+        for (i, (_, share)) in shares.iter().enumerate() {
+            let marker = get_secret_marker(i);
+            let marker_offset = find_marker(&modified, marker).expect("marker should exist");
+            let start = marker_offset + marker.len();
+            let end = start + 32;
+            modified[start..end].copy_from_slice(share);
+        }
+
+        modified
     }
 
     #[test]
@@ -505,7 +625,7 @@ mod tests {
 
     #[test]
     fn extract_payload_from_sentinel_without_launcher_size_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("SNAPFZZ_SEAL_LAUNCHER_SIZE");
         }
@@ -556,7 +676,7 @@ mod tests {
 
     #[test]
     fn extract_payload_from_launcher_size_env_skips_sentinel() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_LAUNCHER_SIZE", "12");
         }
@@ -578,11 +698,9 @@ mod tests {
     fn load_master_secret_extracts_embedded_secret_from_binary_bytes() {
         let secret = [0x5A; 32];
         let path = unique_temp_path("embedded-secret");
-        let mut binary = vec![0xAA; 16];
-        binary.extend_from_slice(LAUNCHER_SECRET_MARKER);
-        binary.extend_from_slice(&secret);
-        binary.extend_from_slice(&[0xBB; 16]);
-        std::fs::write(&path, &binary).unwrap();
+        let launcher = launcher_with_secret_slots(16, 32);
+        let embedded = embed_secret_for_launcher(&launcher, &secret);
+        std::fs::write(&path, &embedded).unwrap();
 
         let payload_bytes = std::fs::read(&path).unwrap();
         let loaded = load_master_secret(&payload_bytes).expect("embedded secret should load");
@@ -593,7 +711,7 @@ mod tests {
 
     #[test]
     fn load_master_secret_falls_back_to_env_when_marker_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "ab".repeat(32));
         }
@@ -608,7 +726,7 @@ mod tests {
 
     #[test]
     fn env_var_set_overrides_when_no_marker_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "ef".repeat(32));
         }
@@ -624,17 +742,38 @@ mod tests {
 
     #[test]
     fn load_master_secret_falls_back_to_env_when_marker_payload_truncated() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "cd".repeat(32));
         }
 
         let mut binary = vec![0xAA; 16];
-        binary.extend_from_slice(LAUNCHER_SECRET_MARKER);
+        binary.extend_from_slice(get_secret_marker(0));
         binary.extend_from_slice(&[0xEE; 31]);
 
         let loaded = load_master_secret(&binary).expect("truncated marker should fall back");
         assert_eq!(loaded, [0xCD; 32]);
+
+        unsafe {
+            std::env::remove_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX");
+        }
+    }
+
+    #[test]
+    fn load_master_secret_falls_back_to_env_when_fewer_than_threshold_shares_are_present() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        unsafe {
+            std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "de".repeat(32));
+        }
+
+        let mut binary = vec![0xAB; 16];
+        for i in 0..(SHAMIR_THRESHOLD - 1) {
+            binary.extend_from_slice(get_secret_marker(i));
+            binary.extend_from_slice(&[0x11; 32]);
+        }
+
+        let loaded = load_master_secret(&binary).expect("insufficient shares should fall back");
+        assert_eq!(loaded, [0xDE; 32]);
 
         unsafe {
             std::env::remove_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX");
@@ -651,26 +790,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn verify_launcher_integrity_detects_mismatch_on_linux() {
-        use snapfzz_seal_core::tamper::compute_hash_of_bytes;
-
-        // Create a mock assembled binary: launcher || sentinel || payload
-        let launcher = vec![0xAA; 100];
-        let expected_hash = compute_hash_of_bytes(&launcher);
-
-        let mut assembled = launcher.clone();
-        assembled.extend_from_slice(LAUNCHER_PAYLOAD_SENTINEL);
-        assembled.extend_from_slice(&[0xBB; 50]);
-
-        // Write to temp file
+        let launcher = launcher_with_secret_slots(96, 32);
         let temp = std::env::temp_dir().join("snapfzz-seal-integrity-test");
-        std::fs::write(&temp, &assembled).unwrap();
+        std::fs::write(&temp, &launcher).unwrap();
 
-        // Wrong hash should fail
+        let regions = find_integrity_regions(&launcher).expect("regions");
+        let expected_hash = compute_binary_integrity_hash(&launcher, &regions).expect("hash");
+
         let err = verify_launcher_integrity(&[0xCC; 32], Some(temp.to_str().unwrap()))
             .expect_err("wrong hash must fail");
         assert!(matches!(err, SealError::TamperDetected));
 
-        // Correct hash should pass
         verify_launcher_integrity(&expected_hash, Some(temp.to_str().unwrap()))
             .expect("correct hash should pass");
 
@@ -679,7 +809,7 @@ mod tests {
 
     #[test]
     fn load_master_secret_fails_when_env_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX");
         }
@@ -690,7 +820,7 @@ mod tests {
 
     #[test]
     fn init_tracing_handles_verbose_false_without_env_filter() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("RUST_LOG");
         }
@@ -699,7 +829,7 @@ mod tests {
 
     #[test]
     fn init_tracing_handles_verbose_true_without_env_filter() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("RUST_LOG");
         }
@@ -708,7 +838,7 @@ mod tests {
 
     #[test]
     fn init_tracing_prefers_env_filter_when_present() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("RUST_LOG", "warn");
         }
@@ -800,7 +930,7 @@ mod tests {
 
     #[test]
     fn load_payload_bytes_none_errors_without_proc_self_exe() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("SNAPFZZ_SEAL_LAUNCHER_SIZE");
         }
@@ -829,7 +959,7 @@ mod tests {
 
     #[test]
     fn extract_payload_from_assembled_binary_rejects_launcher_size_beyond_length() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_LAUNCHER_SIZE", "100");
         }
@@ -895,7 +1025,7 @@ mod tests {
 
     #[test]
     fn load_master_secret_errors_when_hex_invalid() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "zzzz");
         }
@@ -910,7 +1040,7 @@ mod tests {
 
     #[test]
     fn load_master_secret_errors_when_hex_too_short() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "aa".repeat(31));
         }
@@ -929,15 +1059,19 @@ mod tests {
         let user_fingerprint = [0x22; 32];
         let snapshot = sample_snapshot(b"4026531836");
 
+        let integrity_binary = vec![0xA1; 256];
         let stable_key = derive_launcher_key(
             &master_secret,
             &user_fingerprint,
             &snapshot,
             FingerprintMode::Stable,
+            &integrity_binary,
         );
         let stable_hash = canonicalize_stable(&snapshot);
-        let expected = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
+        let env_key = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
             .expect("env key derivation should succeed");
+        let expected = derive_key_with_integrity_from_binary(&env_key, &integrity_binary)
+            .expect("integrity binding should succeed");
 
         assert_eq!(stable_key, expected);
     }
@@ -948,21 +1082,26 @@ mod tests {
         let user_fingerprint = [0x44; 32];
         let snapshot = sample_snapshot(b"4026531836");
 
+        let integrity_binary = vec![0xB2; 256];
         let session_key = derive_launcher_key(
             &master_secret,
             &user_fingerprint,
             &snapshot,
             FingerprintMode::Session,
+            &integrity_binary,
         );
         let stable_hash = canonicalize_stable(&snapshot);
         let env_key = derive_env_key(&master_secret, &stable_hash, &user_fingerprint)
             .expect("env key derivation should succeed");
+        let integrity_bound_env =
+            derive_key_with_integrity_from_binary(&env_key, &integrity_binary)
+                .expect("integrity binding should succeed");
         let ephemeral_hash = canonicalize_ephemeral(&snapshot);
-        let expected = derive_session_key(&env_key, &ephemeral_hash)
+        let expected = derive_session_key(&integrity_bound_env, &ephemeral_hash)
             .expect("session key derivation should succeed");
 
         assert_eq!(session_key, expected);
-        assert_ne!(session_key, env_key);
+        assert_ne!(session_key, integrity_bound_env);
     }
 
     #[test]
@@ -972,17 +1111,23 @@ mod tests {
         let snapshot_a = sample_snapshot(b"4026531836");
         let snapshot_b = sample_snapshot(b"4026531900");
 
+        let integrity_binary_a = vec![0xC3; 256];
+        let mut integrity_binary_b = integrity_binary_a.clone();
+        integrity_binary_b[40] ^= 0xFF;
+
         let key_a = derive_launcher_key(
             &master_secret,
             &user_fingerprint,
             &snapshot_a,
             FingerprintMode::Session,
+            &integrity_binary_a,
         );
         let key_b = derive_launcher_key(
             &master_secret,
             &user_fingerprint,
             &snapshot_b,
             FingerprintMode::Session,
+            &integrity_binary_b,
         );
 
         assert_ne!(
@@ -1063,7 +1208,7 @@ mod tests {
 
     #[test]
     fn extract_payload_from_assembled_binary_rejects_invalid_launcher_size_env() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_LAUNCHER_SIZE", "not-a-number");
         }
@@ -1078,7 +1223,7 @@ mod tests {
 
     #[test]
     fn extract_payload_from_assembled_binary_errors_when_marker_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::remove_var("SNAPFZZ_SEAL_LAUNCHER_SIZE");
         }
@@ -1109,7 +1254,7 @@ mod tests {
 
     #[test]
     fn load_master_secret_accepts_valid_hex() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("SNAPFZZ_SEAL_MASTER_SECRET_HEX", "ab".repeat(32));
         }

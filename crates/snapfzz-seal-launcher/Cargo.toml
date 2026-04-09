@@ -15,9 +15,11 @@ zeroize = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rand = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = { workspace = true }
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

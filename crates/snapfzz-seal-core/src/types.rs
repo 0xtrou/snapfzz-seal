@@ -8,12 +8,30 @@ pub const FMT_STREAM: u16 = 0x0001;
 pub const CHUNK_SIZE: usize = 65536; // 64KB
 pub const KDF_INFO_ENV: &[u8] = b"snapfzz-seal/env/v1";
 pub const KDF_INFO_SESSION: &[u8] = b"snapfzz-seal/session/v1";
-pub const LAUNCHER_SECRET_MARKER: &[u8; 32] =
-    b"ASL_SECRET_MRK_v1\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0A\x0B\x0C\x0D\x0E";
-pub const LAUNCHER_TAMPER_MARKER: &[u8; 32] =
-    b"ASL_TAMPER_MRK_v1\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1A\x1B\x1C\x1D\x1E";
-pub const LAUNCHER_PAYLOAD_SENTINEL: &[u8; 32] =
-    b"ASL_PAYLOAD_SPLIT_v1\xA0\xA1\xA2\xA3\xA4\xA5\xA6\xA7\xA8\xA9\xAA\xAB";
+
+include!(concat!(env!("OUT_DIR"), "/generated_markers.rs"));
+
+pub fn get_secret_marker(index: usize) -> &'static [u8; 32] {
+    match index {
+        0 => &SECRET_MARKER_0,
+        1 => &SECRET_MARKER_1,
+        2 => &SECRET_MARKER_2,
+        3 => &SECRET_MARKER_3,
+        4 => &SECRET_MARKER_4,
+        _ => panic!("Invalid marker index"),
+    }
+}
+
+pub fn get_decoy_marker(set: usize, index: usize) -> &'static [u8; 32] {
+    &DECOY_MARKERS[set * 5 + index]
+}
+
+pub const SHAMIR_TOTAL_SHARES: usize = 5;
+pub const SHAMIR_THRESHOLD: usize = 3;
+
+pub const LAUNCHER_SECRET_MARKER: &[u8; 32] = &SECRET_MARKER_0;
+pub const LAUNCHER_TAMPER_MARKER: &[u8; 32] = &TAMPER_MARKER;
+pub const LAUNCHER_PAYLOAD_SENTINEL: &[u8; 32] = &PAYLOAD_SENTINEL;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PayloadHeader {

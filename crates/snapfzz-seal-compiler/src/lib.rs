@@ -1,6 +1,7 @@
 pub mod assemble;
 pub mod backend;
 pub mod compile;
+pub mod decoys;
 pub mod embed;
 
 use clap::{Parser, ValueEnum};

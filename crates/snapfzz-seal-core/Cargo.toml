@@ -3,6 +3,11 @@ name = "snapfzz-seal-core"
 version = "0.1.0"
 edition = "2024"
 
+[build-dependencies]
+sha2 = "0.10"
+rand = "0.8"
+chrono = "0.4"
+
 [dependencies]
 anyhow = { workspace = true }
 thiserror = { workspace = true }

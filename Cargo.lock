@@ -301,7 +301,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -1896,6 +1898,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "rand",
  "serde",
  "serde_json",
  "sha2",
@@ -1913,6 +1916,7 @@ dependencies = [
  "aead-stream",
  "aes-gcm",
  "anyhow",
+ "chrono",
  "ed25519-dalek",
  "hex",
  "hkdf",
@@ -1951,6 +1955,7 @@ dependencies = [
  "libc",
  "memfd",
  "nix",
+ "rand",
  "seccompiler",
  "serde",
  "serde_json",
