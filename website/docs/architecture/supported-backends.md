@@ -4,7 +4,13 @@ sidebar_position: 4
 
 # Supported Backends
 
-Snapfzz Seal supports multiple compilation backends for transforming agent source code into sealed executables. Each backend is optimized for specific runtime environments and agent architectures.
+Snapfzz Seal supports compilation backends for transforming agent source code into sealed executables. This document describes **currently implemented** backends and their limitations.
+
+:::warning
+
+Some features documented elsewhere (auto-install, `--backend-opts`, `--backend-chain`) are **NOT implemented**. This document reflects reality.
+
+:::
 
 ## Backend Overview
 
@@ -15,11 +21,11 @@ Backends are responsible for compiling agent source code into standalone executa
 - **Dependency handling** — Static vs dynamic linking
 - **Platform support** — Target OS and architecture
 
-## Built-in Backends
+## Currently Implemented Backends
 
 ### PyInstaller Backend
 
-**Status**: Stable
+**Status**: Implemented
 
 Compiles Python agents into standalone executables using PyInstaller's bundling mechanism.
 
@@ -29,10 +35,11 @@ Compiles Python agents into standalone executables using PyInstaller's bundling 
 - Windows x86_64
 
 **Features**:
-- Automatic dependency detection
-- Single-file bundling (`--onefile`)
-- Support for Python 3.7+
-- Optional UPX compression
+- ✅ Single-file bundling (`--onefile`)
+- ✅ Basic dependency detection
+- ❌ NO auto-install (requires pre-installed PyInstaller)
+- ❌ NO `--backend-opts` passthrough
+- ❌ NO UPX compression via CLI
 
 **Configuration**:
 
@@ -40,19 +47,20 @@ Compiles Python agents into standalone executables using PyInstaller's bundling 
 seal compile \
   --backend pyinstaller \
   --project ./my_agent \
-  --output ./agent.sealed \
-  --backend-opts="--onefile --noconsole"
+  --user-fingerprint "$USER_FP" \
+  --sandbox-fingerprint auto \
+  --output ./agent.sealed
 ```
 
 **Requirements**:
 - Python 3.7 or later
-- PyInstaller 5.0+ (auto-installed if missing)
+- **PyInstaller must be pre-installed** (`pip install pyinstaller`)
 - Target platform Python environment
 
 **Limitations**:
 - Larger binary size (includes Python runtime)
 - Slower startup compared to native code
-- May require additional hidden imports for dynamic imports
+- Returns error if `pyinstaller` command not found
 
 **Best for**:
 - Python-based agents with complex dependencies
@@ -61,7 +69,7 @@ seal compile \
 
 ### Nuitka Backend
 
-**Status**: Stable
+**Status**: Implemented (Default)
 
 Compiles Python agents into optimized native executables using Nuitka's ahead-of-time compilation.
 
@@ -71,11 +79,12 @@ Compiles Python agents into optimized native executables using Nuitka's ahead-of
 - Windows x86_64
 
 **Features**:
-- Full Python-to-C compilation
-- Significant performance improvements over PyInstaller
-- Smaller binary footprint
-- Optional LLVM-based optimizations
-- Plugin support for common frameworks
+- ✅ Python-to-C compilation
+- ✅ Better performance than PyInstaller
+- ✅ Smaller binary footprint
+- ❌ NO auto-install (requires pre-installed Nuitka)
+- ❌ NO `--backend-opts` passthrough
+- ❌ NO plugin flags via CLI
 
 **Configuration**:
 
@@ -83,251 +92,147 @@ Compiles Python agents into optimized native executables using Nuitka's ahead-of
 seal compile \
   --backend nuitka \
   --project ./my_agent \
-  --output ./agent.sealed \
-  --backend-opts="--enable-plugin=numpy --follow-imports"
+  --user-fingerprint "$USER_FP" \
+  --sandbox-fingerprint auto \
+  --output ./agent.sealed
 ```
 
 **Requirements**:
 - Python 3.7 or later
 - C compiler (gcc, clang, or MSVC)
-- Nuitka 1.5+ (auto-installed if missing)
+- **Nuitka must be pre-installed** (`pip install nuitka`)
 - Development headers for compiled dependencies
 
 **Compilation time**: Significantly longer than PyInstaller due to full compilation pass
 
 **Limitations**:
 - Longer compilation times
-- May require additional compilation flags for specific dependencies
-- Debugging is more complex
+- Returns error if `nuitka` command not found
 
 **Best for**:
 - Performance-critical Python agents
 - Production deployments requiring minimal overhead
 - Agents with computationally intensive workloads
 
+## Backends NOT Exposed to Users
+
 ### Go Backend
 
-**Status**: Stable
+**Status**: Implemented internally, **NOT user-accessible**
 
-Compiles Go agents directly using the Go compiler.
+The Go backend exists in the compiler crate but is **not exposed via `seal compile` CLI**.
 
-**Supported platforms**:
-- Linux x86_64, arm64
-- macOS x86_64, arm64
-- Windows x86_64
+**Why not accessible**:
+- `seal compile` only accepts `--backend nuitka` or `--backend pyinstaller`
+- No `--backend go` option in current CLI
+- Hardcoded for internal use with `GOOS=linux`, `GOARCH=amd64`
 
-**Features**:
-- Native Go compilation
-- Static binary generation
-- Cross-compilation support
-- Minimal runtime dependencies
-- Small binary footprint
-
-**Configuration**:
-
+**Do NOT attempt**:
 ```bash
-seal compile \
-  --backend go \
-  --project ./my_agent \
-  --output ./agent.sealed \
-  --backend-opts="-ldflags '-s -w'"
+# This will FAIL - go backend not exposed
+seal compile --backend go --project ./agent
 ```
 
-**Requirements**:
-- Go 1.18 or later
-- Go module support (`go.mod`)
-
-**Limitations**:
-- Go-specific only
-- Requires proper module configuration
-
-**Best for**:
-- Go-based agents
-- Minimal binary size requirements
-- High-performance networking agents
+## Backends NOT Implemented
 
 ### Native Backend
 
-**Status**: Stable
+**Status**: NOT IMPLEMENTED
 
-Direct sealing of pre-compiled binaries without additional compilation.
+Contrary to some documentation, there is **no native backend** for sealing pre-compiled binaries.
 
-**Supported platforms**:
-- All platforms (uses existing binary)
+**What doesn't exist**:
+- ❌ No `--backend native` option
+- ❌ No `--binary` flag for pre-compiled executables
+- ❌ No direct sealing of arbitrary binaries
 
-**Features**:
-- No compilation overhead
-- Full control over build process
-- Support for any executable format
-- Ideal for CI/CD integration
-
-**Configuration**:
-
-```bash
-seal compile \
-  --backend native \
-  --binary ./pre-built-agent \
-  --output ./agent.sealed
-```
-
-**Requirements**:
-- Pre-compiled executable matching target platform
-- Binary must be compatible with target execution environment
-
-**Limitations**:
-- No automatic dependency handling
-- Operator responsible for binary compatibility
-
-**Best for**:
-- Pre-compiled agents from external build systems
-- Custom compilation pipelines
-- Integration with existing build processes
+**If you need this**:
+- Build your executable separately
+- Use a Python shim that calls your binary
+- Compile with PyInstaller/Nuitka wrapping your tool
 
 ## Backend Selection
 
-### Automatic Selection
-
-When no backend is specified, Snapfzz Seal attempts automatic selection:
-
-1. **Go detection** — Checks for `go.mod` in project root
-2. **Python detection** — Checks for `requirements.txt`, `setup.py`, or `.py` files
-   - Prefers Nuitka if available (better performance)
-   - Falls back to PyInstaller
-3. **Native fallback** — Uses existing binary if provided
-
 ### Manual Selection
 
-Specify backend explicitly for deterministic behavior:
+Specify backend explicitly:
 
 ```bash
-seal compile --backend <backend-name> --project ./agent
+seal compile --backend <nuitka|pyinstaller> --project ./agent --user-fingerprint "$FP" --sandbox-fingerprint auto --output ./agent.sealed
 ```
 
-### Backend Chain
+### Default Behavior
 
-Multiple backends can be chained for fallback behavior:
+When `--backend` is omitted, defaults to `nuitka`.
 
-```bash
-seal compile \
-  --backend-chain nuitka,pyinstaller,native \
-  --project ./agent
-```
+### What DOESN'T Exist
 
-The chain attempts each backend in order until one succeeds.
+**Auto-detection**: NOT IMPLEMENTED
+- No automatic detection of project type
+- No fallback chain between backends
+- Manual selection required if default fails
 
-## Custom Backends
+**Backend chain**: NOT IMPLEMENTED
+- No `--backend-chain` option
+- No fallback behavior
 
-Organizations can implement custom backends for specialized compilation requirements.
-
-### Backend Interface
-
-```rust
-pub trait CompileBackend: Send + Sync {
-    fn name(&self) -> &str;
-    fn can_compile(&self, project_dir: &Path) -> bool;
-    fn compile(&self, config: &CompileConfig) -> Result<PathBuf, SealError>;
-}
-```
-
-### Implementation Requirements
-
-1. **Deterministic detection** — `can_compile()` must return consistent results for identical inputs
-2. **Artifact path** — `compile()` must return path to valid executable
-3. **Error handling** — Use descriptive `SealError` variants for diagnostics
-4. **Thread safety** — Backend must be `Send + Sync` for concurrent compilation
-
-### Registration
-
-Custom backends are registered at initialization:
-
-```rust
-let backend = MyCustomBackend::new();
-seal::register_backend(Box::new(backend));
-```
+**Backend options**: NOT IMPLEMENTED
+- No `--backend-opts` passthrough
+- Cannot pass custom flags to backend tools
 
 ## Backend Performance Comparison
 
-| Backend | Compilation Time | Binary Size | Runtime Performance | Dependencies |
-|---------|-----------------|-------------|---------------------|--------------|
-| PyInstaller | Fast (30s-2m) | Large (50-200MB) | Slower (interpreter) | Python runtime |
-| Nuitka | Slow (2-10m) | Medium (30-100MB) | Fast (native) | None |
-| Go | Fast (10-30s) | Small (5-20MB) | Fast (native) | None |
-| Native | Instant | Variable | Native | Variable |
-
-## Backend Configuration Options
-
-### Common Options
-
-| Option | Description | Applies To |
-|--------|-------------|------------|
-| `--backend` | Specify backend name | All |
-| `--backend-opts` | Pass options to backend | All |
-| `--backend-chain` | Fallback chain | All |
-
-### PyInstaller-Specific
-
-| Option | Description |
-|--------|-------------|
-| `--onefile` | Bundle into single executable |
-| `--noconsole` | Hide console window (Windows) |
-| `--hidden-import` | Specify additional imports |
-| `--add-data` | Include data files |
-
-### Nuitka-Specific
-
-| Option | Description |
-|--------|-------------|
-| `--enable-plugin` | Enable framework plugin |
-| `--follow-imports` | Include imported modules |
-| `--nofollow-import-to` | Exclude specific modules |
-| `--include-package` | Include entire package |
+| Backend | Compilation Time | Binary Size | Runtime Performance |
+|---------|-----------------|-------------|---------------------|
+| PyInstaller | Fast (30s-2m) | Large (50-200MB) | Slower (interpreter) |
+| Nuitka | Slow (2-10m) | Medium (30-100MB) | Fast (native) |
 
 ## Troubleshooting
+
+### Backend Tool Not Found
+
+**Symptom**: `pyinstaller not found` or `nuitka not found`
+
+**Cause**: Backend tool not installed
+
+**Solution**:
+```bash
+# For PyInstaller
+pip install pyinstaller
+
+# For Nuitka
+pip install nuitka
+```
 
 ### Missing Dependencies
 
 **Symptom**: Compilation fails with import errors
 
-**Solution**: Specify hidden imports or packages:
+**Cause**: Dynamic imports not detected by backend
 
-```bash
-# PyInstaller
---backend-opts="--hidden-import=my_module"
-
-# Nuitka
---backend-opts="--include-package=my_package"
-```
-
-### Large Binary Size
-
-**Symptom**: Sealed binary exceeds expected size
-
-**Solution**: Use Nuitka for Python, or enable compression:
-
-```bash
-# Nuitka with optimizations
---backend-opts="--nofollow-import-to=tests --follow-imports"
-
-# PyInstaller with UPX
---backend-opts="--onefile --upx-dir=/path/to/upx"
-```
+**Solution**:
+- For PyInstaller: Manually create a spec file with hidden imports
+- For Nuitka: Use a `nuitka.config` file in your project
+- Note: Cannot pass these via `seal compile` CLI (no `--backend-opts`)
 
 ### Cross-Compilation Issues
 
 **Symptom**: Binary fails to execute on target platform
 
-**Solution**: Use appropriate backend for target platform:
+**Cause**: Backend compiled for wrong platform
 
-```bash
-# Go cross-compilation
-GOOS=linux GOARCH=amd64 seal compile --backend go --project ./agent
-```
+**Solution**:
+- Run compilation on target platform
+- Or use appropriate cross-compilation setup for the backend tool
 
 ## Future Backends
 
-The following backends are planned for future releases:
+The following backends are **planned** but NOT implemented:
 
 - **Rust** — Native Rust compilation via Cargo
-- **Node.js** — JavaScript/TypeScript agents via pkg or nexe
-- **Java** — JVM agents via GraalVM native-image
+- **Node.js** — JavaScript/TypeScript agents
+- **Java** — JVM agents via GraalVM
 - **.NET** — C#/F# agents via Native AOT
+- **Native** — Direct binary sealing
+
+These appear in planning documents but have no implementation. Do not rely on them.

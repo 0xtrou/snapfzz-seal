@@ -35,12 +35,16 @@ seal compile \
 Flags:
 
 - `--project`: source project directory
-- `--user-fingerprint`: 32-byte fingerprint in hex
-- `--sandbox-fingerprint`: `auto` or 32-byte hex value
+- `--user-fingerprint`: 32-byte fingerprint in hex (64 hex characters)
+- `--sandbox-fingerprint`: `auto` or 32-byte hex value (64 hex characters)
 - `--output`: destination file path
-- `--launcher`: explicit launcher path override
-- `--backend`: compile backend selection
-- `--mode`: payload mode byte selection
+- `--launcher`: explicit launcher path override (or use `SNAPFZZ_SEAL_LAUNCHER_PATH`)
+- `--backend`: compile backend selection (`nuitka` or `pyinstaller`, default: `nuitka`)
+- `--mode`: payload mode byte selection (`batch` or `interactive`)
+
+**Requirements**:
+- Backend tool must be pre-installed (`pip install nuitka` or `pip install pyinstaller`)
+- Launcher binary must exist (build with `cargo build --release`)
 
 ## `seal keygen`
 
@@ -56,6 +60,14 @@ Default:
 
 - `~/.snapfzz-seal/keys`
 
+Output:
+
+```text
+secret: /home/<user>/.snapfzz-seal/keys/builder_secret.key
+public: /home/<user>/.snapfzz-seal/keys/builder_public.key
+builder id: <16-hex-prefix>
+```
+
 ## `seal sign`
 
 ```bash
@@ -66,6 +78,8 @@ Flags:
 
 - `--key`: builder secret key path (hex-encoded 32-byte key)
 - `--binary`: target artifact to sign in place
+
+No output on success.
 
 ## `seal verify`
 
@@ -80,10 +94,16 @@ Flags:
 
 Output modes:
 
-- `VALID (pinned to explicit public key)`
-- `VALID (TOFU: using embedded key ...)`
-- `INVALID`
-- `WARNING: unsigned`
+- `VALID (pinned to explicit public key)` — Signature matches pinned key
+- `VALID (TOFU: using embedded key — use --pubkey for pinned builder identity)` — Signature valid but using embedded key
+- `INVALID` — Signature verification failed
+- `WARNING: unsigned` — No signature block found
+
+:::note
+
+`INVALID` result still exits with code `0`. Check output for verification status.
+
+:::
 
 ## `seal launch`
 
@@ -92,21 +112,49 @@ seal launch \
   [--payload <path>] \
   [--fingerprint-mode <stable|session>] \
   [--user-fingerprint <64-hex>] \
-  [--mode <batch|interactive>] \
-  [--verbose] \
-  [--max-lifetime <seconds>] \
-  [--grace-period <seconds>]
+  [--verbose]
 ```
 
 Flags:
 
-- `--payload`: explicit payload path, optional when self-contained execution is used
-- `--fingerprint-mode`: stable or session
-- `--user-fingerprint`: required for key derivation
-- `--mode`: CLI-level launch mode field
+- `--payload`: explicit payload path
+- `--fingerprint-mode`: `stable` or `session` (default: `stable`)
+- `--user-fingerprint`: required for key derivation (64 hex characters)
 - `--verbose`: enables detailed logging
-- `--max-lifetime`: runtime ceiling
-- `--grace-period`: post-signal grace interval
+
+### Flags Parsed but NOT Currently Wired
+
+The following flags are **accepted by the CLI but NOT forwarded to the launcher**:
+
+- `--mode` — Parsed but ignored at runtime
+- `--max-lifetime` — Parsed but ignored at runtime
+- `--grace-period` — Parsed but ignored at runtime
+
+The launcher uses hardcoded values:
+- `grace_period_secs: 30` (not configurable)
+
+These flags may be implemented in future versions. Currently, they have no effect.
+
+### Environment Variables for Launch
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `SNAPFZZ_SEAL_MASTER_SECRET_HEX` | Optional* | 32-byte secret in hex for key derivation fallback |
+| `SNAPFZZ_SEAL_LAUNCHER_SIZE` | Optional | Launcher-size hint for embedded payload extraction |
+
+\* Only required if no embedded secret is available. Normal `seal compile` output includes embedded secret.
+
+### Output
+
+On success, outputs JSON:
+
+```json
+{
+  "exit_code": 0,
+  "stdout": "...",
+  "stderr": ""
+}
+```
 
 ## `seal server`
 
@@ -119,45 +167,100 @@ seal server \
 
 Flags:
 
-- `--bind`: listening socket
-- `--compile-dir`: working directory for compile jobs
-- `--output-dir`: artifact output directory
+- `--bind`: listening socket (default: `0.0.0.0:9090` in wrapper, `127.0.0.1:9090` in standalone binary)
+- `--compile-dir`: working directory for compile jobs (default: `./.snapfzz-seal/compile`)
+- `--output-dir`: artifact output directory (default: `./.snapfzz-seal/output`)
+
+:::warning No Authentication
+
+The server has **no built-in authentication or authorization**. Deploy behind an authenticated gateway.
+
+:::
 
 ## Exit codes
 
 Current CLI behavior:
 
 - `0`: command completed without error
-- `1`: command returned an error path in CLI dispatcher
+- `1`: command returned an error (runtime error)
+- `2`: CLI argument parse error (clap default)
 
-Subprocess exit semantics from launched payloads are returned in JSON execution output fields and are distinct from CLI command exit handling.
+Note: `seal verify` returns `0` even for `INVALID` results. Check output text.
+
+Subprocess exit codes from launched payloads are returned in JSON output, not as CLI exit codes.
 
 ## Environment variables
 
 | Variable | Purpose |
-|---|---|
-| `SNAPFZZ_SEAL_MASTER_SECRET_HEX` | 32-byte secret in hex for launch key derivation fallback |
-| `SNAPFZZ_SEAL_LAUNCHER_PATH` | launcher path used by compile when `--launcher` is omitted |
-| `SNAPFZZ_SEAL_LAUNCHER_SIZE` | optional launcher-size hint for embedded payload extraction |
-| `RUST_LOG` | tracing verbosity (`error`, `warn`, `info`, `debug`, `trace`) |
-| `DOCKER_BIN` | explicit Docker binary for server sandbox backend |
+|----------|---------|
+| `SNAPFZZ_SEAL_MASTER_SECRET_HEX` | 32-byte secret in hex for launch key derivation (fallback if no embedded secret) |
+| `SNAPFZZ_SEAL_LAUNCHER_PATH` | Launcher path used by compile when `--launcher` is omitted |
+| `SNAPFZZ_SEAL_LAUNCHER_SIZE` | Optional launcher-size hint for embedded payload extraction |
+| `RUST_LOG` | Tracing verbosity (`error`, `warn`, `info`, `debug`, `trace`) |
+| `DOCKER_BIN` | Explicit Docker binary path for server sandbox backend |
 
 ## Practical examples
 
+### Complete workflow
+
 ```bash
-seal compile --project ./agent --user-fingerprint "$USER_FP" --sandbox-fingerprint auto --output ./agent.sealed
-seal sign --key ~/.snapfzz-seal/keys/builder_secret.key --binary ./agent.sealed
-seal verify --binary ./agent.sealed --pubkey ~/.snapfzz-seal/keys/builder_public.key
-SNAPFZZ_SEAL_MASTER_SECRET_HEX=<secret> seal launch --payload ./agent.sealed --user-fingerprint "$USER_FP"
+# 1. Build the launcher first
+cargo build --release
+
+# 2. Generate keys
+seal keygen
+
+# 3. Generate user fingerprint
+USER_FP=$(openssl rand -hex 32)
+
+# 4. Compile and seal
+seal compile \
+  --project ./examples/demo_agent \
+  --user-fingerprint "$USER_FP" \
+  --sandbox-fingerprint auto \
+  --output ./agent.sealed \
+  --launcher ./target/release/snapfzz-seal-launcher
+
+# 5. Sign
+seal sign \
+  --key ~/.snapfzz-seal/keys/builder_secret.key \
+  --binary ./agent.sealed
+
+# 6. Verify
+seal verify \
+  --binary ./agent.sealed \
+  --pubkey ~/.snapfzz-seal/keys/builder_public.key
+
+# 7. Launch
+seal launch \
+  --payload ./agent.sealed \
+  --user-fingerprint "$USER_FP"
+```
+
+### Using environment variables
+
+```bash
+# Set launcher path globally
+export SNAPFZZ_SEAL_LAUNCHER_PATH=./target/release/snapfzz-seal-launcher
+
+# Now compile without --launcher flag
+seal compile \
+  --project ./agent \
+  --user-fingerprint "$USER_FP" \
+  --sandbox-fingerprint auto \
+  --output ./agent.sealed
 ```
 
 ## Security considerations
 
-- Prefer pinned key verification over TOFU in production automation.
-- Avoid passing secrets via shell history in shared terminals.
-- Restrict server command network exposure to authenticated local interfaces or protected tunnels.
+- **Use pinned key verification** in production automation, not TOFU mode.
+- **Avoid passing secrets via shell history** in shared terminals environments.
+- **Restrict server network exposure** to authenticated local interfaces or protected tunnels.
+- **Treat compile logs as potentially sensitive** — they may contain operational details.
 
 ## Limitations
 
-- Exit code taxonomy is currently binary for CLI command success or failure.
+- Exit code taxonomy is currently binary for CLI command success/failure.
 - Structured machine-readable command output is limited to selected commands.
+- `--backend-opts` for passing flags to backend tools is NOT implemented.
+- Backend auto-install is NOT implemented — tools must be pre-installed.

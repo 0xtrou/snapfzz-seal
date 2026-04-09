@@ -4,18 +4,24 @@ sidebar_position: 3
 
 # Capabilities
 
-Snapfzz Seal provides a comprehensive set of security capabilities designed to protect AI agent deployments in production environments. This document outlines the core capabilities and their operational characteristics.
+Snapfzz Seal provides security capabilities designed to protect AI agent deployments in production environments. This document outlines the core capabilities and their **actual implementation status**.
+
+:::warning
+
+This document reflects the **current implementation**. Some features documented elsewhere may be planned but not yet implemented.
+
+:::
 
 ## Cryptographic Capabilities
 
 ### Encryption at Rest
 
-**Specification**: AES-256-GCM with 96-bit nonces
+**Specification**: AES-256-GCM with 7-byte stream nonces
 
 All agent payloads are encrypted using AES-256-GCM (Galois/Counter Mode), providing both confidentiality and authenticity. The encryption envelope includes:
 
 - 256-bit encryption key derived via HKDF-SHA256
-- 96-bit nonce generated per encryption operation
+- 7-byte stream nonce per encryption operation (not 12-byte standard nonce)
 - 128-bit authentication tag verified on decryption
 - Streaming encryption for large payloads (chunked at 64KB boundaries)
 
@@ -31,43 +37,60 @@ All agent payloads are encrypted using AES-256-GCM (Galois/Counter Mode), provid
 The decryption key is derived using HKDF (HMAC-based Key Derivation Function) with the following inputs:
 
 1. **Master secret** — 256-bit random value generated at compile time
-2. **User fingerprint** — Arbitrary identifier provided by operator
-3. **Sandbox fingerprint** — Runtime environment measurements
+2. **Stable hash** — Hash of stable environment signals
+3. **User fingerprint** — Arbitrary identifier provided by operator
 
 The derivation process:
 
 ```
-PRK = HKDF-Extract(salt=user_fingerprint, IKM=master_secret)
-Key = HKDF-Expand(PRK, info=sandbox_fingerprint, L=32)
+salt = stable_hash || user_fingerprint
+PRK = HKDF-Extract(salt=salt, IKM=master_secret)
+Key = HKDF-Expand(PRK, info="snapfzz-seal/env/v1", L=32)
 ```
 
+**Session mode** adds a second HKDF step with an ephemeral hash.
+
 **Security properties**:
-- Key is cryptographically bound to both fingerprints
+- Key is cryptographically bound to environment and user fingerprint
 - Different fingerprint combinations produce independent keys
-- Master secret never appears in plaintext in the final binary
+
+:::caution
+
+The **master secret is embedded in plaintext** in the final binary. This is necessary for self-contained execution but means an attacker with binary access can extract it. See [Threat Model](../security/threat-model.md) for implications.
+
+:::
 
 ### Digital Signatures
 
 **Specification**: Ed25519 (EdDSA over Curve25519)
 
-All sealed binaries must carry a valid Ed25519 signature from a trusted key. The signature covers:
-
-- Encrypted payload
-- Fingerprint metadata
-- Launcher executable
+All sealed binaries must carry a valid Ed25519 signature. The signature covers the **entire binary content**.
 
 **Security properties**:
 - 128-bit security level against forgery attacks
 - Small signature size (64 bytes)
 - Fast verification (suitable for constrained environments)
 
+:::warning Signature Trust Model
+
+The launcher verifies signatures using the **public key embedded in the artifact itself**. This means:
+
+- ✅ Detects tampering with signed content
+- ✅ Prevents accidental corruption
+- ❌ Does **NOT** verify the signer's identity
+- ❌ An attacker can replace content, re-sign with their own key, and pass verification
+
+For production use, you must implement **external key pinning** or trust policies. The signature provides integrity, not authenticity to a trusted identity.
+
+:::
+
 ## Execution Capabilities
 
 ### Memory-Only Execution
 
-**Specification**: memfd_create + fexecve (Linux), ramdisk execution (macOS)
+**Specification**: memfd_create + fexecve (Linux only)
 
-The sealed payload is decrypted and executed entirely in memory, without intermediate disk storage. The implementation:
+The sealed payload is decrypted and executed entirely in memory on Linux, without intermediate disk storage. The implementation:
 
 1. Creates an anonymous memory file via `memfd_create()`
 2. Writes decrypted payload to the memory file
@@ -79,13 +102,18 @@ The sealed payload is decrypted and executed entirely in memory, without interme
 - Forensic analysis of disk reveals only encrypted payload
 - Protection against disk-based extraction attacks
 
+**Platform limitations**:
+- ✅ Linux x86_64: Full memfd execution
+- ❌ macOS: **NOT IMPLEMENTED** — Returns "memfd unsupported" error
+- ❌ Windows: **NOT IMPLEMENTED** — Returns error
+
 ### Runtime Verification
 
 **Specification**: Multi-stage verification before execution
 
 Before any payload execution, the launcher performs:
 
-1. **Signature verification** — Ed25519 signature validated against trusted public key
+1. **Signature verification** — Ed25519 signature validated (using embedded public key)
 2. **Fingerprint derivation** — Runtime environment measured and key derived
 3. **Decryption attempt** — Payload decrypted using derived key
 4. **Integrity check** — Authentication tag verified
@@ -94,149 +122,216 @@ If any stage fails, execution is aborted with an appropriate error code.
 
 ### Anti-Debugging Protections
 
-**Specification**: ptrace scope restrictions, timing checks
+**Specification**: Limited ptrace restrictions (Linux only)
 
-The launcher implements several anti-debugging mechanisms:
+The launcher implements basic anti-debugging on Linux:
 
-- **ptrace scope** — Sets `PR_SET_DUMPABLE` to 0, preventing ptrace attachment
-- **Timing checks** — Detects abnormal execution timing indicative of debugging
-- **Tracer detection** — Checks `/proc/self/status` for tracer presence
-- **Parent verification** — Validates parent process characteristics
+- ✅ **PR_SET_DUMPABLE=0** — Prevents ptrace attachment
+- ✅ **ptrace(TRACEME)** — Claims tracer slot
+
+**NOT IMPLEMENTED** (despite claims elsewhere):
+- ❌ Timing checks for debugging detection
+- ❌ Tracer detection via `/proc/self/status`
+- ❌ Parent process verification
 
 **Security properties**:
-- Raises the cost of dynamic analysis
-- Detection of common debugging attempts
+- Raises the cost of casual debugging attempts
 - May be bypassed by sophisticated adversaries with elevated privileges
 
 ### System Call Filtering
 
-**Specification**: seccomp-bpf with strict allowlist
+**Specification**: seccomp-bpf with allowlist (Linux only)
 
-The launcher installs a seccomp filter that restricts the set of allowed system calls. The default allowlist includes:
+The launcher attempts to install a seccomp filter that restricts allowed system calls. The default allowlist includes:
 
 - Memory operations: `mmap`, `munmap`, `mprotect`, `brk`
 - File operations: `read`, `write`, `open`, `close`, `stat`, `lstat`, `fstat`
 - Process operations: `exit`, `exit_group`, `arch_prctl`
 - Network operations: `socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`
+- Process creation: `clone`, `clone3` (allowed, contrary to some docs)
 
-Blocked syscall categories:
-- Process creation: `fork`, `clone`, `vfork` (unless required by agent)
-- Kernel module operations: `init_module`, `delete_module`
-- io_uring operations: `io_uring_setup`, `io_uring_enter`, `io_uring_register` (removed due to security concerns)
+**NOT blocked**: `fork`, `vfork` (despite claims elsewhere)
+
+:::caution Best-Effort Enforcement
+
+If seccomp application fails, the launcher **logs a warning and continues without seccomp**. This is not a hard security boundary.
+
+:::
 
 **Security properties**:
-- Reduces kernel attack surface
-- Prevents certain privilege escalation techniques
+- Reduces kernel attack surface (when successfully applied)
 - Limits capabilities of compromised agents
+- Not guaranteed — can be bypassed if application fails
 
 ## Fingerprinting Capabilities
 
 ### Host Signal Collection
 
-**Specification**: Multi-source host measurement
+**Specification**: Multi-source host measurement (Linux only)
 
-The fingerprinting module collects signals from various sources:
+The fingerprinting module collects signals from various Linux-specific sources:
 
-| Source | Linux | macOS | Stability |
-|--------|-------|-------|-----------|
-| Kernel version | ✓ | ✓ | Stable |
-| CPU model | ✓ | ✓ | Stable |
-| CPU feature flags | ✓ | ✓ | Stable |
-| Memory total | ✓ | ✓ | Semi-stable |
-| Mount points | ✓ | — | Ephemeral |
-| Network interfaces | ✓ | ✓ | Semi-stable |
-| Machine ID | ✓ | — | Stable |
+| Source | Implemented | Stability |
+|--------|-------------|-----------|
+| Machine ID hash | ✅ | Stable |
+| Hostname | ✅ | Semi-stable |
+| Kernel release | ✅ | Stable |
+| cgroup path | ✅ | Semi-stable |
+| proc cmdline hash | ✅ | Ephemeral |
+| MAC address (first non-loopback) | ✅ | Semi-stable |
+| DMI product UUID HMAC | ✅ | Stable |
+| Namespace inodes | ✅ | Ephemeral |
+
+**NOT IMPLEMENTED** (despite claims elsewhere):
+- ❌ CPU model
+- ❌ CPU feature flags
+- ❌ Memory total
+- ❌ Mount points table
+- ❌ Full network interface inventory
+
+**Platform limitations**:
+- ✅ Linux: Full fingerprinting support
+- ❌ macOS: **NOT IMPLEMENTED** (uses Linux-only paths like `/proc`, `/sys`)
+- ❌ Windows: **NOT IMPLEMENTED**
 
 ### Canonicalization
 
 **Specification**: Deterministic canonical representation
 
-Collected signals are canonicalized into a consistent format:
+Collected signals are canonicalized using:
 
-1. Sort signals by key name (lexicographic order)
-2. Normalize values (trim whitespace, consistent case)
-3. Concatenate key-value pairs with delimiter
-4. Hash the concatenated string (SHA-256)
+1. Sort signal IDs lexicographically
+2. Encode with length-prefixed binary format
+3. Hash the encoded data (SHA-256)
 
-This ensures identical environments produce identical fingerprints, while different environments produce distinct fingerprints.
-
-### Ephemeral vs Stable Signals
-
-**Ephemeral signals** — Change frequently (e.g., mount points, running processes)
-- Used for short-lived execution bindings
-- Suitable for one-time execution scenarios
-- May break across container restarts
-
-**Stable signals** — Change rarely (e.g., kernel version, CPU model)
-- Used for long-term binding
-- Suitable for persistent deployment scenarios
-- Survive container restarts on same host
+This ensures identical environments produce identical fingerprints.
 
 ## Orchestration Capabilities
 
 ### REST API
 
-**Specification**: OpenAPI 3.0 compatible
+**Implemented endpoints**:
 
-Snapfzz Seal provides an orchestration API for automated workflows:
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/api/v1/compile` | POST | Compile and seal an agent |
+| `/api/v1/dispatch` | POST | Launch a sealed agent in sandbox |
+| `/api/v1/jobs/{job_id}` | GET | Check job status |
+| `/api/v1/jobs/{job_id}/results` | GET | Get execution results |
+| `/health` | GET | Health check |
 
-- **POST /compile** — Compile and seal an agent from source
-- **POST /sign** — Sign a sealed binary
-- **POST /launch** — Launch a sealed agent in a sandbox
-- **GET /status/\{id\}** — Check execution status
-- **GET /logs/\{id\}** — Retrieve execution logs
+**Request/Response schemas**:
 
-All endpoints support:
-- JSON request/response bodies
-- JWT authentication (when configured)
-- Rate limiting (governor-based)
+`POST /api/v1/compile`:
+```json
+{
+  "project_dir": "./my_agent",
+  "user_fingerprint": "64-hex-string",
+  "sandbox_fingerprint": "auto"
+}
+```
+
+Response (202):
+```json
+{
+  "job_id": "uuid",
+  "status": "pending"
+}
+```
+
+`POST /api/v1/dispatch`:
+```json
+{
+  "job_id": "uuid",
+  "sandbox": {
+    "image": "ubuntu:22.04",
+    "timeout_secs": 3600,
+    "memory_mb": 512,
+    "env": [["KEY", "value"]]
+  }
+}
+```
+
+**NOT IMPLEMENTED** (despite claims elsewhere):
+- ❌ `POST /sign` endpoint
+- ❌ `POST /launch` endpoint (use `/dispatch`)
+- ❌ `GET /status/{id}` (use `/api/v1/jobs/{id}`)
+- ❌ `GET /logs/{id}` endpoint
+- ❌ Real-time log streaming
+- ❌ JWT authentication
+- ❌ Rate limiting
+- ❌ OpenAPI spec generation
+
+:::warning
+
+The server API has **no built-in authentication or authorization**. Deploy behind an authenticated gateway.
+
+:::
 
 ### Sandbox Integration
 
-**Specification**: Docker container isolation (primary)
+**Current implementation**: Docker container isolation only
 
-The orchestration API can provision isolated execution environments:
+The orchestration API provisions Docker containers with:
 
-- **Docker** — Full container isolation with resource limits
-- **Firecracker** — MicroVM isolation (planned)
-- **Native** — Direct execution with seccomp (development only)
+- ✅ Container isolation with namespace/cgroup separation
+- ✅ Memory limit (optional)
+- ✅ Timeout enforcement
+- ✅ Automatic cleanup on completion
+- ✅ Hardened flags: `--security-opt no-new-privileges`, `--cap-drop ALL`, `--read-only`, `--tmpfs /tmp`
+- ✅ Fixed pids limit (64)
 
-Sandbox capabilities:
-- Resource limits (CPU, memory, disk I/O)
-- Network isolation (optional)
-- Automatic cleanup on completion
-- Timeout enforcement
+**NOT IMPLEMENTED in server sandbox**:
+- ❌ CPU quota/period configuration
+- ❌ Disk I/O limits
+- ❌ Network disable/isolation flag
+- ❌ Volume mounting
+- ❌ Custom seccomp profiles
+- ❌ AppArmor/SELinux profiles
+- ❌ Log streaming (post-execution capture only)
+- ❌ Firecracker backend
+- ❌ Native backend
 
 ## Platform Support
 
 ### Linux x86_64
 
-**Full support** — All capabilities available
+**Full support** — All core capabilities available
 
-- Native memfd execution
-- seccomp filtering
-- All fingerprinting sources
-- Full encryption and signing
-- Docker and Firecracker sandbox options
+- ✅ Native memfd execution
+- ✅ seccomp filtering (best-effort)
+- ✅ All fingerprinting sources
+- ✅ Full encryption and signing
+- ✅ Docker sandbox execution
+
+**NOT IMPLEMENTED**:
+- ❌ Firecracker sandbox (planned only)
 
 ### macOS arm64
 
-**Partial support** — Decryption and verification only
+**NOT SUPPORTED** — Cannot execute sealed agents
 
-- Ramdisk-based execution (not true memfd)
-- No seccomp (macOS uses different sandboxing)
-- Limited fingerprinting sources
-- Encryption and signing supported
-- Native sandbox only
+- ❌ No memfd execution (returns error)
+- ❌ No seccomp (different OS)
+- ❌ No fingerprinting (Linux-only paths)
+- ✅ Can compile and sign (build-side operations)
+- ❌ Cannot launch sealed agents
 
 ### Windows x86_64
 
-**No-op stub** — Compatibility layer only
+**NOT SUPPORTED** — Cannot execute sealed agents
 
-- Execution disabled by default
-- Returns success without running agent
-- Suitable for cross-platform builds
-- No security guarantees
+- ❌ No memfd execution (returns error)
+- ❌ No seccomp
+- ❌ No fingerprinting
+- ✅ Can compile and sign (build-side operations)
+- ❌ Cannot launch sealed agents
+
+:::warning Platform Reality
+
+Contrary to some documentation, there is **no "no-op stub"** for Windows/macOS that returns success. Execution on non-Linux platforms **fails with an error**.
+
+:::
 
 ## Operational Characteristics
 
@@ -259,7 +354,7 @@ Sandbox capabilities:
 ### Scalability Limits
 
 - **Maximum payload size**: 2GB (limited by memory and address space)
-- **Maximum concurrent executions**: Limited by host resources and sandbox backend
+- **Maximum concurrent executions**: Limited by host resources and Docker
 - **Key rotation**: Manual process, requires re-compilation
 
 ## Security Guarantees and Limitations
@@ -268,30 +363,33 @@ Sandbox capabilities:
 
 1. **Encryption** — Strong encryption of agent payloads using AES-256-GCM
 2. **Binding** — Cryptographic binding to runtime environment fingerprints
-3. **Verification** — Mandatory signature verification before execution
-4. **Anti-extraction** — Memory-only execution prevents disk-based extraction
-5. **Sandboxing** — Process-level isolation via seccomp and container backends
+3. **Verification** — Signature verification before execution (integrity, not identity)
+4. **Anti-extraction** — Memory-only execution on Linux prevents disk-based extraction
+5. **Sandboxing** — Docker container isolation with resource limits
 
 ### What Snapfzz Seal Does NOT Provide
 
 1. **Hardware attestation** — No TPM/SGX integration
-2. **Perfect security** — Determined adversaries with sufficient privileges can extract keys from memory
-3. **Network security** — Agent network traffic is not encrypted or authenticated by Snapfzz Seal
-4. **Key distribution** — Secure distribution of signing keys and master secrets is the operator's responsibility
-5. **Runtime integrity** — Once executing, the agent process is not monitored for tampering
+2. **Trusted signer identity** — Signatures verify integrity, not identity (attacker can re-sign)
+3. **Perfect security** — Master secret is embedded in binary; privileged adversaries can extract it
+4. **Network security** — Agent network traffic is not encrypted or authenticated
+5. **Key distribution** — Secure distribution of signing keys and master secrets is operator's responsibility
+6. **Runtime integrity** — Once executing, the agent process is not monitored for tampering
+7. **Cross-platform execution** — Only Linux supports sealed agent execution
 
 ### Threat Model Summary
 
 Snapfzz Seal is effective against:
 
 - Casual extraction attempts from disk
-- Execution on unauthorized machines
-- Supply chain tampering (with proper key management)
+- Execution on unauthorized machines (if fingerprints differ)
+- Accidental artifact corruption
 - Simple dynamic analysis attempts
 
 Snapfzz Seal is NOT effective against:
 
-- Privileged adversaries with physical access
+- Privileged adversaries with memory access
+- Attackers who can re-sign modified artifacts
 - Nation-state level attacks
 - Compromised signing keys
 - Memory dumping by privileged processes
