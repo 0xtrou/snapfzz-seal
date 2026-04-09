@@ -5,6 +5,9 @@
 
 /* ==================== LIGHT MODE (Default) ==================== */
 :root {
+  --ifm-font-family-base: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --ifm-font-family-monospace: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+  
   --ifm-color-primary: #FF6B00;
   --ifm-color-primary-dark: #E85C00;
   --ifm-color-primary-darker: #D95200;
