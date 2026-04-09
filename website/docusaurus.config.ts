@@ -5,7 +5,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 const config: Config = {
   title: 'Snapfzz Seal',
   tagline: 'Encrypted, sandbox-bound agent delivery system',
-  favicon: 'img/favicon.ico',
+  favicon: 'img/favicon.svg',
 
   future: {
     v4: true,
@@ -31,6 +31,7 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           editUrl: 'https://github.com/0xtrou/snapfzz-seal/tree/main/website/',
+          sidebarCollapsed: false,
         },
         theme: {
           customCss: './src/css/custom.css',
@@ -125,10 +126,6 @@ const config: Config = {
       additionalLanguages: ['rust', 'toml', 'bash'],
     },
   } satisfies Preset.ThemeConfig,
-  
-  scripts: [
-    '/js/expand-sidebar.js',
-  ],
 };
 
 export default config;
