@@ -1,3 +1,7 @@
+---
+sidebar_position: 3
+---
+
 # How It Works
 
 This section describes the internal execution path of Snapfzz Seal from source compilation to in-memory launch.

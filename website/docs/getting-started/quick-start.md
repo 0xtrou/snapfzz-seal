@@ -1,3 +1,7 @@
+---
+sidebar_position: 2
+---
+
 # Quick Start
 
 This section provides a complete end-to-end example with expected output and operational checks.

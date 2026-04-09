@@ -1,5 +1,5 @@
 ---
-sidebar_position: 3
+sidebar_position: 4
 ---
 
 # Capabilities
@@ -268,7 +268,7 @@ The server API has **no built-in authentication or authorization**. Deploy behin
 
 **Current implementation**: Docker container isolation only
 
-For detailed sandbox documentation, see [Supported Sandboxes](./supported-sandboxes.md).
+For detailed sandbox documentation, see [Supported Sandboxes](../architecture/supported-sandboxes.md).
 
 The orchestration API provisions Docker containers with:
 

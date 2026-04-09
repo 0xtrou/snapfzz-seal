@@ -1,3 +1,7 @@
+---
+sidebar_position: 5
+---
+
 # Signing Workflow
 
 This document specifies key lifecycle and signature verification procedures for Snapfzz Seal artifacts.

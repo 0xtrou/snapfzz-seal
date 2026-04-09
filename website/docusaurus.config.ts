@@ -82,8 +82,8 @@ const config: Config = {
               to: '/docs/getting-started/installation',
             },
             {
-              label: 'Architecture',
-              to: '/docs/architecture/how-it-works',
+              label: 'How It Works',
+              to: '/docs/getting-started/how-it-works',
             },
             {
               label: 'CLI Reference',

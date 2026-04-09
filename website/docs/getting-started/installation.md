@@ -1,3 +1,7 @@
+---
+sidebar_position: 1
+---
+
 # Installation
 
 This section describes deterministic installation and verification procedures for Snapfzz Seal.
