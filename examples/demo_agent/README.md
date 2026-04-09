@@ -33,6 +33,9 @@ seal keygen --keys-dir ./keys
 
 # 2. Compile and seal (batch mode)
 USER_FP=$(echo -n "my-user" | sha256sum | cut -d' ' -f1)
+# Note: --sandbox-fingerprint auto generates a random binding nonce, not a real
+# sandbox measurement. For production, collect a fingerprint from your target
+# environment and pass it explicitly (as the demo.sh script does).
 seal compile \
     --project examples/demo_agent \
     --user-fingerprint "$USER_FP" \
@@ -45,6 +48,7 @@ seal compile \
 seal sign --key ./keys/key --binary /tmp/demo.sealed
 
 # 4. Verify and run
+# --pubkey pins builder identity; omitting it uses TOFU (embedded key)
 seal verify --binary /tmp/demo.sealed --pubkey ./keys/key.pub
 AGENT_SEAL_MASTER_SECRET_HEX=... /tmp/demo.sealed --user-fingerprint "$USER_FP"
 ```

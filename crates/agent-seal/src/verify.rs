@@ -18,17 +18,21 @@ pub fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let data = &binary[..binary.len() - 100];
     let sig: [u8; 64] = binary[binary.len() - 96..binary.len() - 32].try_into()?;
     let embedded: [u8; 32] = binary[binary.len() - 32..].try_into()?;
+    let using_embedded = cli.pubkey.is_none();
     let pubkey = cli
         .pubkey
         .map_or(Ok(embedded), |path| decode32(path, "public key"))?;
-    println!(
-        "{}",
-        if agent_seal_core::signing::verify(&pubkey, data, &sig)? {
-            "VALID"
+
+    let valid = agent_seal_core::signing::verify(&pubkey, data, &sig)?;
+    if valid {
+        if using_embedded {
+            println!("VALID (TOFU: using embedded key — use --pubkey for pinned builder identity)");
         } else {
-            "INVALID"
+            println!("VALID (pinned to explicit public key)");
         }
-    );
+    } else {
+        println!("INVALID");
+    }
     Ok(())
 }
 

@@ -8,9 +8,71 @@ use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 
 #[cfg(target_os = "linux")]
 const ALLOWED_SYSCALLS_X86_64: &[i64] = &[
-    0, 1, 3, 60, 231, 202, 14, 13, 131, 9, 11, 10, 12, 158, 257, 5, 8, 217, 332, 262, 89, 21, 439,
-    293, 32, 33, 292, 291, 233, 232, 281, 228, 35, 39, 110, 102, 104, 107, 108, 41, 42, 44, 45, 47,
-    46, 48, 49, 50, 288, 54, 55, 56, 435, 7, 271, 23, 270, 425, 426, 427, 4, 6, 63, 318,
+    // I/O
+    0,   // read
+    1,   // write
+    3,   // close
+    60,  // exit
+    231, // exit_group
+    202, // sched_yield
+    14,  // rt_sigprocmask
+    13,  // rt_sigaction
+    131, // unknown (verify against target kernel headers)
+    9,   // mmap
+    11,  // munmap
+    10,  // mprotect
+    12,  // brk
+    158, // arch_prctl
+    257, // newfstatat
+    5,   // fstat
+    8,   // lseek
+    217, // getdents64
+    332, // unknown (verify against target kernel headers)
+    262, // unknown (verify against target kernel headers)
+    89,  // readlink
+    21,  // access
+    439, // faccessat2
+    293, // pipe2
+    32,  // dup
+    33,  // dup2
+    292, // dup3
+    291, // epoll_create1
+    233, // epoll_ctl
+    232, // epoll_wait
+    281, // epoll_pwait
+    228, // clock_gettime
+    35,  // nanosleep
+    39,  // getpid
+    110, // getppid
+    102, // getuid
+    104, // getgid
+    107, // geteuid
+    108, // getegid
+    41,  // socket
+    42,  // connect
+    44,  // sendto
+    45,  // recvfrom
+    47,  // recvmsg
+    46,  // sendmsg
+    48,  // shutdown
+    49,  // bind
+    50,  // listen
+    288, // accept4
+    54,  // setsockopt
+    55,  // getsockopt
+    56,  // clone (required: fork/exec child agent process)
+    435, // clone3 (required: fork/exec child agent process)
+    7,   // poll
+    271, // ppoll
+    23,  // select
+    270, // pselect6
+    425, // unknown (verify against target kernel headers)
+    426, // unknown (verify against target kernel headers)
+    427, // unknown (verify against target kernel headers)
+    4,   // stat
+    6,   // lstat
+    63,  // uname
+    318, // getrandom
 ];
 #[cfg(target_os = "linux")]
 pub(crate) fn allowed_syscalls() -> &'static [i64] {

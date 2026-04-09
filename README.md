@@ -4,7 +4,7 @@
 ![Coverage](docs/badges/coverage.svg)
 ![Rust](docs/badges/rust-version.svg)
 
-Agent Seal is an encrypted, sandbox-bound agent delivery system for Linux. It compiles agents into sealed payloads, binds decryption to runtime fingerprints, executes from memory, and avoids shipping API keys in delivered binaries.
+Agent Seal is an encrypted, sandbox-bound agent delivery system for Linux. It compiles agents into sealed payloads, binds decryption to runtime fingerprints, executes from memory. The master secret used for key derivation is embedded in assembled binaries by default (env var delivery is a fallback); provider API keys inside agent payloads are encrypted, not shipped in plaintext.
 
 The primary interface is a single binary, `seal`, with six subcommands:
 
@@ -78,8 +78,8 @@ The primary interface is a single binary, `seal`, with six subcommands:
 
 ### Dual HKDF derivation model
 
-- `K_env = HKDF(master_secret, stable_fingerprint || user_fingerprint, "agent-seal/env/v1")`
-- `K_session = HKDF(K_env, ephemeral_fingerprint, "agent-seal/session/v1")`
+- `K_env = HKDF(ikm=master_secret, salt=stable_fingerprint || user_fingerprint, info="agent-seal/env/v1")`
+- `K_session = HKDF(ikm=K_env, salt=ephemeral_fingerprint, info="agent-seal/session/v1")`
 
 ### Payload format (v1)
 
@@ -112,13 +112,15 @@ Current target runtimes:
 - Firecracker microVM environments
 - gVisor-style sandboxed Linux runtime contexts
 
+> **Note:** Runtime detection is heuristic-based (cgroups, `/proc` files, env vars), not hardware-attested. It is advisory metadata and does not feed into the cryptographic fingerprint hash.
+
 ## Threat Model
 
 ### Protected against
 
 - Casual payload extraction from static binaries
 - Running encrypted payload in an unrelated sandbox environment
-- Direct exposure of provider API keys from shipped agent artifacts
+- Direct exposure of provider API keys from shipped agent artifacts (encrypted at rest; master secret is embedded in assembled binaries)
 - Payload tampering: Ed25519 signatures verify builder identity and payload integrity
 
 ### Not protected against
@@ -126,6 +128,7 @@ Current target runtimes:
 - **Root-level compromise** on host or sandbox
 - Hardware-backed attestation bypass scenarios
 - Full runtime memory extraction by privileged adversaries
+- **Local process environment inspection**: when using env var fallback for master secret delivery, the secret is visible in `/proc/[pid]/environ` to root and same-UID processes. The embedded-secret path avoids this.
 
 In short: Agent Seal raises attacker cost and narrows abuse windows; it is not a replacement for host trust or attestation systems.
 
@@ -167,7 +170,7 @@ Auto-detection tries backends in order: Nuitka → PyInstaller → Go. Explicit 
 | macOS arm64 | Stub (protection + cleanup) | Cross-compile via Docker | Foundation |
 | Windows x86_64 | Stub (no-op) | Cross-compile via Docker | Foundation |
 
-Linux launcher features: seccomp allowlist filter, `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)`, ptrace anti-debug, env scrub (master secret denied to child), output size limits (64 MB/stream), self-delete on launch.
+Linux launcher features: seccomp allowlist filter, `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE(0)`, ptrace anti-debug, env scrub (master secret denied to child), output size limits (64 MB/stream, silent truncation), self-delete on launch.
 
 ### Fingerprint Signals
 
@@ -177,7 +180,7 @@ Linux launcher features: seccomp allowlist filter, `PR_SET_NO_NEW_PRIVS`, `PR_SE
 | Hostname | Semi-stable | Linux | Active |
 | Kernel release | Stable | Linux | Active |
 | Cgroup path | Semi-stable | Linux | Active |
-| Proc cmdline hash | Stable | Linux | Active |
+| Proc cmdline hash | Stable | Linux | Active (low entropy in homogeneous cloud fleets) |
 | MAC address | Stable | Linux | Active |
 | DMI product UUID HMAC | Stable | Linux | Active |
 | Namespace inodes (mnt/pid/net/uts) | Ephemeral | Linux | Active (session mode) |
@@ -209,6 +212,8 @@ cargo build --workspace
 seal compile --project ./agent --user-fingerprint u1 --sandbox-fingerprint auto --output ./out --backend nuitka
 ```
 
+> **Note:** `--sandbox-fingerprint auto` generates a cryptographically random binding nonce, not an actual sandbox measurement. For real environment binding, collect a fingerprint from your target sandbox and pass it explicitly.
+
 ### Launch
 
 ```bash
@@ -218,7 +223,7 @@ seal launch --payload ./out/payload.asl --fingerprint-mode stable --user-fingerp
 ### Run orchestration server
 
 ```bash
-seal server --bind 0.0.0.0:9090 --compile-dir ./.agent-seal/compile --output-dir ./.agent-seal/output
+seal server --bind 127.0.0.1:9090 --compile-dir ./.agent-seal/compile --output-dir ./.agent-seal/output
 ```
 
 ### Run orchestration server
@@ -427,7 +432,7 @@ Starts the Agent Seal orchestration server. Provides a REST API for compiling ag
 ```text
 Usage: seal server [OPTIONS]
 Options:
-  --bind <ADDR>                   Listen address [default: 0.0.0.0:9090]
+  --bind <ADDR>                   Listen address [default: 127.0.0.1:9090]
   --compile-dir <PATH>            Directory for compile artifacts [default: ./.agent-seal/compile]
   --output-dir <PATH>             Directory for output binaries [default: ./.agent-seal/output]
 ```
@@ -458,6 +463,8 @@ pending -> compiling -> ready -> dispatched -> running -> completed
   "sandbox_fingerprint": "64-hex-string"
 }
 ```
+
+> **Note:** `project_dir` must be within the server's configured `--compile-dir`. Paths outside the workspace are rejected with `400 Bad Request`.
 
 Response `202 Accepted`:
 ```json

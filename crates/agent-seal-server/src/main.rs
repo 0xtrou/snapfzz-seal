@@ -6,7 +6,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "agent-seal-server")]
 struct Cli {
-    #[arg(long = "bind", default_value = "0.0.0.0:9090")]
+    #[arg(long = "bind", default_value = "127.0.0.1:9090")]
     bind: String,
 
     #[arg(long = "compile-dir", default_value = "./.agent-seal/compile")]

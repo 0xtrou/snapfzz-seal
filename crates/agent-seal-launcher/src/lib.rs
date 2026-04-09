@@ -55,10 +55,12 @@ pub struct Cli {
 
 fn verify_signature(payload_bytes: &[u8]) -> Result<(), SealError> {
     if payload_bytes.len() < SIG_BLOCK_SIZE {
+        tracing::warn!("payload too short for signature verification; skipping");
         return Ok(());
     }
     let sig_start = payload_bytes.len() - SIG_BLOCK_SIZE;
     if &payload_bytes[sig_start..sig_start + 4] != SIG_MAGIC {
+        tracing::warn!("no signature block found; payload is unsigned");
         return Ok(());
     }
 

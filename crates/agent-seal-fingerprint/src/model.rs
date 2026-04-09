@@ -56,7 +56,7 @@ pub static FINGERPRINT_SOURCES: LazyLock<Vec<FingerprintSourceDef>> = LazyLock::
         },
         FingerprintSourceDef {
             id: "linux.hostname".to_string(),
-            class: Stability::Stable,
+            class: Stability::SemiStable,
             default_on: true,
             privileged: false,
             description: "Normalized kernel hostname for the current runtime.",
@@ -70,7 +70,7 @@ pub static FINGERPRINT_SOURCES: LazyLock<Vec<FingerprintSourceDef>> = LazyLock::
         },
         FingerprintSourceDef {
             id: "linux.cgroup_path".to_string(),
-            class: Stability::Stable,
+            class: Stability::SemiStable,
             default_on: true,
             privileged: false,
             description: "Normalized cgroup path from /proc/self/cgroup.",
@@ -81,6 +81,20 @@ pub static FINGERPRINT_SOURCES: LazyLock<Vec<FingerprintSourceDef>> = LazyLock::
             default_on: true,
             privileged: false,
             description: "SHA-256 hash of allowlisted boot arguments from /proc/cmdline.",
+        },
+        FingerprintSourceDef {
+            id: "linux.mac_address".to_string(),
+            class: Stability::Stable,
+            default_on: true,
+            privileged: false,
+            description: "SHA-256 hash of first non-loopback MAC address.",
+        },
+        FingerprintSourceDef {
+            id: "linux.dmi_product_uuid_hmac".to_string(),
+            class: Stability::Stable,
+            default_on: true,
+            privileged: true,
+            description: "HMAC-SHA256 or SHA-256 hash of /sys/class/dmi/id/product_uuid.",
         },
         FingerprintSourceDef {
             id: "linux.mount_namespace_inode".to_string(),
@@ -234,12 +248,9 @@ mod tests {
 
     #[test]
     fn fingerprint_sources_include_expected_entries_and_flags() {
-        assert_eq!(FINGERPRINT_SOURCES.len(), 9);
-        assert!(
-            FINGERPRINT_SOURCES
-                .iter()
-                .all(|source| source.default_on && !source.privileged)
-        );
+        assert_eq!(FINGERPRINT_SOURCES.len(), 11);
+        assert!(FINGERPRINT_SOURCES.iter().all(|source| source.default_on));
+        assert!(FINGERPRINT_SOURCES.iter().any(|source| source.privileged));
         assert!(
             FINGERPRINT_SOURCES
                 .iter()
@@ -250,5 +261,19 @@ mod tests {
                 .iter()
                 .any(|source| source.class == Stability::Stable)
         );
+    }
+
+    #[test]
+    fn hostname_and_cgroup_are_semistable_in_registry() {
+        let hostname = FINGERPRINT_SOURCES
+            .iter()
+            .find(|s| s.id == "linux.hostname")
+            .unwrap();
+        assert_eq!(hostname.class, Stability::SemiStable);
+        let cgroup = FINGERPRINT_SOURCES
+            .iter()
+            .find(|s| s.id == "linux.cgroup_path")
+            .unwrap();
+        assert_eq!(cgroup.class, Stability::SemiStable);
     }
 }

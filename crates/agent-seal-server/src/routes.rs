@@ -27,6 +27,40 @@ pub struct CompileRequest {
     pub sandbox_fingerprint: String,
 }
 
+/// Validate that a user-supplied project_dir is within the allowed compile directory.
+fn validate_project_dir(
+    project_dir: &str,
+    compile_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, (axum::http::StatusCode, String)> {
+    let path = std::path::PathBuf::from(project_dir);
+
+    let canonical = path.canonicalize().map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("project_dir does not exist or cannot be resolved: {e}"),
+        )
+    })?;
+
+    let base = compile_dir.canonicalize().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compile_dir does not exist or cannot be resolved: {e}"),
+        )
+    })?;
+
+    if !canonical.starts_with(&base) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            format!(
+                "project_dir must be within the configured compile directory ({})",
+                base.display()
+            ),
+        ));
+    }
+
+    Ok(canonical)
+}
+
 #[derive(Debug, Serialize)]
 pub struct CompileResponse {
     pub job_id: String,
@@ -69,15 +103,27 @@ async fn compile(
     Json(req): Json<CompileRequest>,
 ) -> impl IntoResponse {
     let job_id = new_job_id();
+    let validated_project_dir = match validate_project_dir(&req.project_dir, &state.compile_dir) {
+        Ok(p) => p,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
     let created = state
-        .create_job(job_id.clone(), Some(req.project_dir.clone()))
+        .create_job(
+            job_id.clone(),
+            Some(validated_project_dir.to_string_lossy().to_string()),
+        )
         .await;
 
     let state_for_task = state.clone();
     let compile_output_dir = state.compile_dir.join(&job_id);
     let output_path = state.output_dir.join(format!("{job_id}.sealed"));
-    let compile_options =
-        compiler_options_from_request(req, compile_output_dir.clone(), output_path);
+    let compile_options = compiler_options_from_request(
+        validated_project_dir,
+        req.user_fingerprint,
+        req.sandbox_fingerprint,
+        compile_output_dir.clone(),
+        output_path,
+    );
     let job_id_for_task = job_id.clone();
 
     tokio::spawn(async move {
@@ -158,6 +204,7 @@ async fn compile(
             status: created.status,
         }),
     )
+        .into_response()
 }
 
 async fn get_job(
@@ -377,20 +424,22 @@ struct CompileOptions {
 }
 
 fn compiler_options_from_request(
-    req: CompileRequest,
+    project_dir: PathBuf,
+    user_fingerprint: String,
+    sandbox_fingerprint: String,
     compile_output_dir: PathBuf,
     output_path: PathBuf,
 ) -> CompileOptions {
-    let fingerprint_mode = match req.sandbox_fingerprint.as_str() {
+    let fingerprint_mode = match sandbox_fingerprint.as_str() {
         "ephemeral" => FingerprintMode::Session,
         _ => FingerprintMode::Stable,
     };
 
     CompileOptions {
         cli: CompilerCli {
-            project: PathBuf::from(req.project_dir),
-            user_fingerprint: req.user_fingerprint,
-            sandbox_fingerprint: req.sandbox_fingerprint,
+            project: project_dir,
+            user_fingerprint,
+            sandbox_fingerprint,
             output: output_path,
             backend: CliBackend::Nuitka,
             mode: agent_seal_compiler::CliMode::Batch,
@@ -425,8 +474,7 @@ mod tests {
     };
 
     use super::{
-        CompileRequest, FingerprintMode, build_router, compiler_options_from_request, new_job_id,
-        random_hex_4,
+        FingerprintMode, build_router, compiler_options_from_request, new_job_id, random_hex_4,
     };
 
     fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -439,7 +487,17 @@ mod tests {
 
     fn test_state() -> ServerState {
         let root = unique_temp_path("agent-seal-server-tests");
-        ServerState::new(root.join("compile"), root.join("output"))
+        let compile_dir = root.join("compile");
+        let output_dir = root.join("output");
+        fs::create_dir_all(&compile_dir).expect("compile dir should be created");
+        fs::create_dir_all(&output_dir).expect("output dir should be created");
+        ServerState::new(compile_dir, output_dir)
+    }
+
+    fn create_project_under_compile_dir(state: &ServerState, name: &str) -> String {
+        let project_dir = state.compile_dir.join(name);
+        fs::create_dir_all(&project_dir).expect("project dir should be created");
+        project_dir.to_string_lossy().to_string()
     }
 
     fn write_executable_script(path: &PathBuf, body: &str) {
@@ -492,14 +550,11 @@ mod tests {
 
     #[test]
     fn compile_request_with_ephemeral_sandbox_uses_session_mode() {
-        let request = CompileRequest {
-            project_dir: "/tmp/project".to_string(),
-            user_fingerprint: "11".repeat(32),
-            sandbox_fingerprint: "ephemeral".to_string(),
-        };
-
+        let project_dir = PathBuf::from("/tmp/project");
         let options = compiler_options_from_request(
-            request,
+            project_dir,
+            "11".repeat(32),
+            "ephemeral".to_string(),
             PathBuf::from("/tmp/project"),
             PathBuf::from("/tmp/output.bin"),
         );
@@ -509,14 +564,11 @@ mod tests {
 
     #[test]
     fn compile_request_with_auto_sandbox_uses_stable_mode() {
-        let request = CompileRequest {
-            project_dir: "/tmp/project".to_string(),
-            user_fingerprint: "11".repeat(32),
-            sandbox_fingerprint: "auto".to_string(),
-        };
-
+        let project_dir = PathBuf::from("/tmp/project");
         let options = compiler_options_from_request(
-            request,
+            project_dir,
+            "11".repeat(32),
+            "auto".to_string(),
             PathBuf::from("/tmp/project"),
             PathBuf::from("/tmp/output.bin"),
         );
@@ -526,14 +578,11 @@ mod tests {
 
     #[test]
     fn compile_request_passes_explicit_user_fingerprint_to_compiler() {
-        let request = CompileRequest {
-            project_dir: "/tmp/project".to_string(),
-            user_fingerprint: "ab".repeat(32),
-            sandbox_fingerprint: "auto".to_string(),
-        };
-
+        let project_dir = PathBuf::from("/tmp/project");
         let options = compiler_options_from_request(
-            request,
+            project_dir,
+            "ab".repeat(32),
+            "auto".to_string(),
             PathBuf::from("/tmp/project"),
             PathBuf::from("/tmp/output.bin"),
         );
@@ -699,7 +748,9 @@ mod tests {
 
     #[tokio::test]
     async fn compile_returns_accepted_with_job_id() {
-        let app = create_app(test_state());
+        let state = test_state();
+        let project_dir = create_project_under_compile_dir(&state, "demo-agent");
+        let app = create_app(state);
 
         let response = app
             .oneshot(
@@ -707,9 +758,10 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/compile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"project_dir":"/tmp/demo-agent","user_fingerprint":"abcd","sandbox_fingerprint":"auto"}"#,
-                    ))
+                    .body(Body::from(format!(
+                        "{{\"project_dir\":\"{}\",\"user_fingerprint\":\"abcd\",\"sandbox_fingerprint\":\"auto\"}}",
+                        project_dir
+                    )))
                     .expect("request must be valid"),
             )
             .await
@@ -723,7 +775,9 @@ mod tests {
 
     #[tokio::test]
     async fn get_job_returns_job_status() {
-        let app = create_app(test_state());
+        let state = test_state();
+        let project_dir = create_project_under_compile_dir(&state, "demo-agent-job-status");
+        let app = create_app(state);
 
         let create_response = app
             .clone()
@@ -732,9 +786,10 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/compile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"project_dir":"/tmp/demo-agent","user_fingerprint":"abcd","sandbox_fingerprint":"auto"}"#,
-                    ))
+                    .body(Body::from(format!(
+                        "{{\"project_dir\":\"{}\",\"user_fingerprint\":\"abcd\",\"sandbox_fingerprint\":\"auto\"}}",
+                        project_dir
+                    )))
                     .expect("request must be valid"),
             )
             .await
@@ -779,7 +834,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_non_ready_job_returns_bad_request() {
-        let app = create_app(test_state());
+        let state = test_state();
+        let project_dir = create_project_under_compile_dir(&state, "demo-agent-dispatch-non-ready");
+        let app = create_app(state);
 
         let create_response = app
             .clone()
@@ -788,9 +845,10 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/compile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"project_dir":"/tmp/demo-agent","user_fingerprint":"abcd","sandbox_fingerprint":"auto"}"#,
-                    ))
+                    .body(Body::from(format!(
+                        "{{\"project_dir\":\"{}\",\"user_fingerprint\":\"abcd\",\"sandbox_fingerprint\":\"auto\"}}",
+                        project_dir
+                    )))
                     .expect("request must be valid"),
             )
             .await
@@ -1248,14 +1306,7 @@ esac
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let payload = response_json(response).await;
-        let job_id = payload["job_id"].as_str().expect("job id").to_string();
-
-        wait_for_status(&state, &job_id, JobState::Failed).await;
-        let job = state.get_job(&job_id).await.expect("job should exist");
-        assert_eq!(job.status, JobState::Failed);
-        assert!(job.error.is_some());
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1274,33 +1325,53 @@ esac
         let state = ServerState::new(compile_dir, output_dir);
         let app = create_app(state.clone());
 
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(&project_dir).expect("project dir should be created");
         let response = app
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/compile")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"project_dir":"/tmp/demo-agent","user_fingerprint":"abcd","sandbox_fingerprint":"auto"}"#,
-                    ))
+                    .body(Body::from(format!(
+                        "{{\"project_dir\":\"{}\",\"user_fingerprint\":\"abcd\",\"sandbox_fingerprint\":\"auto\"}}",
+                        project_dir.to_string_lossy()
+                    )))
                     .expect("request must be valid"),
             )
             .await
             .expect("request should complete");
 
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-        let payload = response_json(response).await;
-        let job_id = payload["job_id"].as_str().expect("job id").to_string();
-
-        wait_for_status(&state, &job_id, JobState::Failed).await;
-        let job = state.get_job(&job_id).await.expect("job should exist");
-        assert!(
-            job.error
-                .as_deref()
-                .expect("job should include error")
-                .contains("failed to create compile directory")
-        );
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod path_validation_tests {
+    use super::validate_project_dir;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn rejects_nonexistent_path() {
+        let tmp = std::env::temp_dir().join("agent-seal-pv-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let result = validate_project_dir("/nonexistent/path/12345", &tmp);
+        assert_eq!(result.unwrap_err().0, StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn accepts_path_within_base() {
+        let tmp = std::env::temp_dir().join("agent-seal-pv-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let inner = tmp.join("project");
+        std::fs::create_dir_all(&inner).unwrap();
+        let result = validate_project_dir(inner.to_str().unwrap(), &tmp);
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

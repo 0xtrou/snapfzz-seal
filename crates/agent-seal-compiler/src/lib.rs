@@ -24,7 +24,11 @@ pub struct Cli {
     pub project: PathBuf,
     #[arg(long)]
     pub user_fingerprint: String,
-    #[arg(long)]
+    #[arg(
+        long,
+        default_value = "auto",
+        help = "64-hex sandbox identity. 'auto' generates a random binding nonce (not a real sandbox measurement). Use 'seal fingerprint' to collect an actual fingerprint."
+    )]
     pub sandbox_fingerprint: String,
     #[arg(long)]
     pub output: PathBuf,

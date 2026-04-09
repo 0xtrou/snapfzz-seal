@@ -124,7 +124,7 @@ impl FingerprintCollector {
         }
 
         collect_mac_address(&mut stable, self.include_mac);
-        collect_dmi_product_uuid(&mut stable, self.include_dmi);
+        collect_dmi_product_uuid(&mut stable, self.include_dmi, self.app_key.as_ref());
 
         if let Some(cmdline) = read_trimmed_text("/proc/cmdline") {
             let filtered = filter_cmdline_allowlist(&cmdline);
@@ -335,7 +335,11 @@ fn parse_mac_address(s: &str) -> Result<Vec<u8>, ()> {
     hex::decode(&hex_str).map_err(|_| ())
 }
 
-fn collect_dmi_product_uuid(sources: &mut Vec<SourceValue>, include_dmi: bool) {
+fn collect_dmi_product_uuid(
+    sources: &mut Vec<SourceValue>,
+    include_dmi: bool,
+    app_key: Option<&[u8; 32]>,
+) {
     if !include_dmi {
         return;
     }
@@ -344,7 +348,11 @@ fn collect_dmi_product_uuid(sources: &mut Vec<SourceValue>, include_dmi: bool) {
     if let Some(content) = read_trimmed_text(path) {
         let normalized = content.trim().to_ascii_lowercase();
         if !normalized.is_empty() && normalized != "not present" {
-            let digest = sha256(normalized.as_bytes());
+            let digest = if let Some(key) = app_key {
+                hmac_sha256(key, normalized.as_bytes()).to_vec()
+            } else {
+                sha256(normalized.as_bytes())
+            };
             push_source(
                 sources,
                 "linux.dmi_product_uuid_hmac",
@@ -601,7 +609,7 @@ mod tests {
     #[test]
     fn collect_dmi_skipped_when_disabled() {
         let mut sources = Vec::new();
-        collect_dmi_product_uuid(&mut sources, false);
+        collect_dmi_product_uuid(&mut sources, false, None);
         assert!(sources.is_empty());
     }
 
