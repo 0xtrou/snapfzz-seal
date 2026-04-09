@@ -100,7 +100,7 @@ Executes sealed agents directly on the host with seccomp-based isolation.
 - Direct hardware access
 - seccomp syscall filtering
 - Resource limits via ulimit
-- Fast startup (< 10ms)
+- Fast startup (\< 10ms)
 
 **Configuration**:
 
@@ -199,7 +199,7 @@ sandbox:
 |----------|--------|--------|-------------|
 | Isolation strength | Strong | Weak | Strongest |
 | Resource overhead | Medium | None | Low |
-| Startup latency | ~500ms | <10ms | ~125ms |
+| Startup latency | ~500ms | \<10ms | ~125ms |
 | Security | Good | Poor | Excellent |
 | Platform support | Broad | Linux | Linux (KVM) |
 | Complexity | Medium | Low | High |
@@ -419,7 +419,7 @@ monitoring:
 | Sandbox | Startup Time | Memory Overhead | CPU Overhead | Isolation |
 |---------|--------------|-----------------|--------------|-----------|
 | Docker | ~500ms | ~50MB | ~2% | Strong |
-| Native | <10ms | ~5MB | ~0% | Weak |
+| Native | \<10ms | ~5MB | ~0% | Weak |
 | Firecracker | ~125ms | ~5MB | ~1% | Strongest |
 
 ## Future Sandboxes

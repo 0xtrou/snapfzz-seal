@@ -183,8 +183,8 @@ Snapfzz Seal provides an orchestration API for automated workflows:
 - **POST /compile** — Compile and seal an agent from source
 - **POST /sign** — Sign a sealed binary
 - **POST /launch** — Launch a sealed agent in a sandbox
-- **GET /status/{id}** — Check execution status
-- **GET /logs/{id}** — Retrieve execution logs
+- **GET /status/\{id\}** — Check execution status
+- **GET /logs/\{id\}** — Retrieve execution logs
 
 All endpoints support:
 - JSON request/response bodies
