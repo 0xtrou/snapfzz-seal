@@ -6,7 +6,7 @@
 
 **Encrypted, sandbox-bound agent delivery system for Linux.**
 
-[📚 Full Documentation](https://0xtrou.github.io/agent-seal/) | [GitHub](https://github.com/0xtrou/agent-seal)
+[📚 Full Documentation](https://0xtrou.github.io/agentseal/) | [GitHub](https://github.com/0xtrou/agentseal)
 
 ## What It Does
 
@@ -82,7 +82,7 @@ Agent Seal raises attacker cost but is **not** a replacement for:
 - Hardware attestation
 - Secure key distribution
 
-See [Threat Model](https://0xtrou.github.io/agent-seal/security/threat-model.html) for details.
+See [Threat Model](https://0xtrou.github.io/agentseal/security/threat-model.html) for details.
 
 ## License
 

@@ -34,3 +34,8 @@ lcov.info
 # Compiler output directory
 out/
 docs/book/
+
+# Docusaurus
+website/node_modules/
+website/build/
+website/.docusaurus/
