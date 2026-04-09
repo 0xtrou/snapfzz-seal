@@ -129,6 +129,7 @@ Current target runtimes:
 - Hardware-backed attestation bypass scenarios
 - Full runtime memory extraction by privileged adversaries
 - **Local process environment inspection**: when using env var fallback for master secret delivery, the secret is visible in `/proc/[pid]/environ` to root and same-UID processes. The embedded-secret path avoids this.
+- **Server API exposure**: the orchestration server is unauthenticated and must remain bound to `127.0.0.1`. Exposure beyond localhost allows unauthenticated compile/dispatch/result access.
 
 In short: Agent Seal raises attacker cost and narrows abuse windows; it is not a replacement for host trust or attestation systems.
 
@@ -448,6 +449,8 @@ Options:
 | POST | `/api/v1/dispatch` | none | Dispatch a compiled job to a sandbox |
 | GET | `/api/v1/jobs/{job_id}` | none | Get job status |
 | GET | `/api/v1/jobs/{job_id}/results` | none | Get job execution results |
+
+> **Security Warning:** The server API is unauthenticated by design. It binds to `127.0.0.1` by default and must remain strictly local. Never expose this API beyond loopback without an authentication proxy (e.g., mTLS gateway, OAuth proxy, or VPN). All routes accept unauthenticated requests — anyone with network access can submit compile jobs, dispatch to sandboxes, and retrieve execution results.
 
 #### Job Lifecycle
 
