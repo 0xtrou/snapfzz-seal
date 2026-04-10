@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/*", "crates/snapfzz-seal"]
 default-members = [
   "crates/snapfzz-seal",
+  "crates/snapfzz-seal-launcher",
 ]
 
 [workspace.dependencies]
