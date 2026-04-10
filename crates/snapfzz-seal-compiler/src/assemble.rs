@@ -212,12 +212,18 @@ mod tests {
             .expect("key derivation should succeed");
         let launcher_with_secret =
             embed_master_secret(&launcher_bytes, &master_secret).expect("secret embed");
+        let launcher_with_decoys =
+            embed_decoy_secrets(&launcher_with_secret, 0).expect("decoys embed");
         let mut tamper_hash = [0_u8; 32];
-        tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
+        tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_decoys));
         let launcher_with_tamper =
-            embed_tamper_hash(&launcher_with_secret, &tamper_hash).expect("tamper embed");
-        let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)
-            .expect("integrity key");
+            embed_tamper_hash(&launcher_with_decoys, &tamper_hash).expect("tamper embed");
+        let whitebox_tables = generate_whitebox_tables(&master_secret);
+        let launcher_with_whitebox =
+            embed_whitebox_tables(&launcher_with_tamper, &whitebox_tables).expect("whitebox embed");
+        let integrity_key =
+            derive_key_with_integrity_from_binary(&env_key, &launcher_with_whitebox)
+                .expect("integrity key");
         let payload_len = pack_payload_with_mode(
             Cursor::new(agent_bytes.clone()),
             &integrity_key,

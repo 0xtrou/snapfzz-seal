@@ -239,10 +239,8 @@ fn measure_loop_duration(iterations: u32) -> Duration {
 
 #[cfg(target_arch = "x86_64")]
 fn check_cpuid_hypervisor() -> bool {
-    unsafe {
-        let cpuid = __cpuid(1);
-        (cpuid.ecx & (1 << 31)) != 0
-    }
+    let cpuid = __cpuid(1);
+    (cpuid.ecx & (1 << 31)) != 0
 }
 
 #[cfg(not(target_arch = "x86_64"))]
