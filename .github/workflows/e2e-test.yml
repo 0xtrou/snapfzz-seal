@@ -68,13 +68,19 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Verify binaries exist
+        run: |
+          ls -la target/release/seal
+          ls -la target/release/seal-launcher
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
           name: binaries
           path: |
             target/release/seal
-            target/release/snapfzz-seal-launcher
+            target/release/seal-launcher
+          if-no-files-found: error
           retention-days: 1
 
   e2e-pyinstaller:
@@ -96,8 +102,8 @@ jobs:
         run: |
           mkdir -p target/release
           cp binaries/seal target/release/
-          cp binaries/snapfzz-seal-launcher target/release/
-          chmod +x target/release/seal target/release/snapfzz-seal-launcher
+          cp binaries/seal-launcher target/release/
+          chmod +x target/release/seal target/release/seal-launcher
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -131,7 +137,7 @@ jobs:
             --user-fingerprint "$USER_FP" \
             --sandbox-fingerprint "$SANDBOX_FP" \
             --output /tmp/agent-pyinstaller.sealed \
-            --launcher ./target/release/snapfzz-seal-launcher \
+            --launcher ./target/release/seal-launcher \
             --backend pyinstaller \
             --mode batch
           
@@ -171,8 +177,8 @@ jobs:
         run: |
           mkdir -p target/release
           cp binaries/seal target/release/
-          cp binaries/snapfzz-seal-launcher target/release/
-          chmod +x target/release/seal target/release/snapfzz-seal-launcher
+          cp binaries/seal-launcher target/release/
+          chmod +x target/release/seal target/release/seal-launcher
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -211,7 +217,7 @@ jobs:
             --user-fingerprint "$USER_FP" \
             --sandbox-fingerprint "$SANDBOX_FP" \
             --output /tmp/agent-nuitka.sealed \
-            --launcher ./target/release/snapfzz-seal-launcher \
+            --launcher ./target/release/seal-launcher \
             --backend nuitka \
             --mode batch
           
@@ -251,8 +257,8 @@ jobs:
         run: |
           mkdir -p target/release
           cp binaries/seal target/release/
-          cp binaries/snapfzz-seal-launcher target/release/
-          chmod +x target/release/seal target/release/snapfzz-seal-launcher
+          cp binaries/seal-launcher target/release/
+          chmod +x target/release/seal target/release/seal-launcher
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -283,7 +289,7 @@ jobs:
             --user-fingerprint "$USER_FP" \
             --sandbox-fingerprint "$SANDBOX_FP" \
             --output /tmp/agent-go.sealed \
-            --launcher ./target/release/snapfzz-seal-launcher \
+            --launcher ./target/release/seal-launcher \
             --mode batch
           
           # Sign

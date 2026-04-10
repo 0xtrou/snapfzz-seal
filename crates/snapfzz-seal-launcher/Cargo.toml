@@ -3,6 +3,10 @@ name = "snapfzz-seal-launcher"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "seal-launcher"
+path = "src/main.rs"
+
 [dependencies]
 snapfzz-seal-core = { path = "../snapfzz-seal-core" }
 snapfzz-seal-fingerprint = { path = "../snapfzz-seal-fingerprint" }
