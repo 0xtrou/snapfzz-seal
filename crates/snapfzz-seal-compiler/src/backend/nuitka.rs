@@ -58,7 +58,21 @@ pub fn compile_with_nuitka(config: &NuitkaConfig) -> Result<PathBuf, SealError> 
 }
 
 fn compile_with_command(command_name: &str, config: &NuitkaConfig) -> Result<PathBuf, SealError> {
+    // Validate project directory before attempting compilation
+    if !config.project_dir.is_dir() {
+        return Err(SealError::InvalidInput(format!(
+            "invalid project path: {}",
+            config.project_dir.display()
+        )));
+    }
+
     let main_py = config.project_dir.join("main.py");
+    if !main_py.exists() {
+        return Err(SealError::InvalidInput(format!(
+            "invalid project path: main.py not found in {}",
+            config.project_dir.display()
+        )));
+    }
 
     let mut command = Command::new(command_name);
     if config.standalone {
@@ -179,9 +193,21 @@ mod tests {
 
     #[test]
     fn nuitka_missing_binary_returns_compilation_error() {
+        let test_root = std::env::temp_dir().join(format!(
+            "snapfzz-seal-nuitka-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&test_root).expect("test root should be creatable");
+        std::fs::write(test_root.join("main.py"), "print('hello')")
+            .expect("main.py should be writable");
+
         let config = NuitkaConfig {
-            project_dir: PathBuf::from("/tmp/example_project"),
-            output_dir: PathBuf::from("/tmp/out"),
+            project_dir: test_root,
+            output_dir: std::env::temp_dir().join("out"),
             onefile: true,
             standalone: true,
             remove_output: true,
@@ -322,6 +348,8 @@ mod tests {
             timeout_secs: 5,
         };
         std::fs::create_dir_all(&config.project_dir).expect("project dir should be creatable");
+        std::fs::write(config.project_dir.join("main.py"), "print('hello')")
+            .expect("main.py should be writable");
 
         let err = compile_with_command(
             fake_nuitka
@@ -376,6 +404,8 @@ mod tests {
             timeout_secs: 5,
         };
         std::fs::create_dir_all(&config.project_dir).expect("project dir should be creatable");
+        std::fs::write(config.project_dir.join("main.py"), "print('hello')")
+            .expect("main.py should be writable");
 
         let err = compile_with_command(
             fake_nuitka
