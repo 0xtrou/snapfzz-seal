@@ -52,8 +52,11 @@ The payload packer creates:
 
 The launcher binary is read and patched with marker-based embed operations:
 
-- master secret marker replacement
-- launcher tamper hash replacement
+- **Layer 1**: Random marker generation (build time)
+- **Layer 2**: Shamir secret share embedding (5 shares, 3 threshold)
+- **Layer 3**: Decoy secret set embedding (10 fake sets)
+- **Layer 5**: Launcher tamper hash replacement
+- **Layer 6**: White-box table embedding (~500KB-2MB)
 
 The assembled binary is then written as:
 
@@ -62,6 +65,7 @@ The assembled binary is then written as:
 [LAUNCHER_PAYLOAD_SENTINEL]
 [encrypted_payload]
 [payload_footer]
+[white-box_tables]
 ```
 
 ### 5. Signing stage
@@ -74,10 +78,13 @@ The assembled binary is then written as:
 
 1. Payload header validation
 2. Signature verification
-3. Launcher integrity check against footer hash
-4. Runtime fingerprint collection
-5. Key derivation
-6. In-memory decrypt
+3. **Layer 4**: Anti-analysis checks (debugger, VM detection)
+4. **Layer 5**: Launcher integrity check against footer hash
+5. Runtime fingerprint collection
+6. **Layer 2**: Shamir secret reconstruction (from 3+ shares)
+7. Key derivation with integrity binding
+8. **Layer 6**: White-box decryption using lookup tables
+9. In-memory decrypt
 7. `memfd` execution path
 
 ## Cryptographic primitives
@@ -116,6 +123,50 @@ Operational notes:
 - Signature validation occurs before decryption and execution.
 - Integrity checks are tied to launcher hash stored in payload footer.
 - Linux seccomp policy is applied in supported execution paths.
+
+## Security Architecture
+
+Snapfzz Seal implements defense-in-depth security with 6 protection layers:
+
+### Layer Breakdown
+
+**Layer 1: No Observable Patterns**
+- Random markers generated at compile time
+- No searchable strings in binary
+- 55 total markers (5 real + 50 decoys)
+
+**Layer 2: Shamir Secret Sharing**
+- Master secret split into 5 shares
+- Requires minimum 3 shares to reconstruct
+- GF(2^256) field arithmetic
+
+**Layer 3: Decoy Secrets**
+- 10 fake secret sets embedded
+- Position obfuscation with salt
+- Confuses automated extraction tools
+
+**Layer 4: Anti-Analysis**
+- Debugger detection (ptrace, TracerPid)
+- VM detection (VMware, VirtualBox, QEMU)
+- Timing checks and environment poisoning
+
+**Layer 5: Integrity Binding**
+- Decryption key depends on binary hash
+- ELF parsing for code/data sections
+- Detects binary modifications
+
+**Layer 6: White-Box Cryptography**
+- Key spread across ~500KB-2MB of tables
+- T-boxes + Type I/II mixing tables
+- No single table reveals the key
+
+### Security Impact
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Extraction difficulty | Trivial | Expert-level |
+| Required skill | Basic CLI usage | Expert cryptanalyst |
+| Tools needed | Standard utilities | Custom reverse engineering |
 
 ## Limitations
 

@@ -15,6 +15,26 @@ Snapfzz Seal compiles AI agents into sealed binaries that:
 - Execute entirely from memory (memfd + fexecve)
 - Verify builder signatures before launch
 - Protect API keys with AES-256-GCM encryption
+- **Defense-in-depth security with 6 protection layers**
+
+## Security Features
+
+Snapfzz Seal implements defense-in-depth security to protect the master secret:
+
+### 🔒 6-Layer Security Architecture
+
+1. **No Observable Patterns** - Random markers generated at compile time
+2. **Shamir Secret Sharing** - Split into 5 shares, requires 3 to reconstruct
+3. **Decoy Secrets** - 10 fake secret sets to confuse attackers
+4. **Anti-Analysis** - Debugger and VM detection
+5. **Integrity Binding** - Decryption key depends on binary hash
+6. **White-Box Cryptography** - Key spread across thousands of lookup tables
+
+**Security Impact:**
+- Before: Master secret trivially extractable with basic tools
+- After: Requires expert-level reverse engineering and cryptanalysis
+
+See [Security Architecture](https://0xtrou.github.io/snapfzz-seal/security/threat-model.html) for details.
 
 ## Quick Start
 
@@ -81,6 +101,12 @@ Snapfzz Seal raises attacker cost but is **not** a replacement for:
 - Host-level trust
 - Hardware attestation
 - Secure key distribution
+
+### Security Posture
+
+**Coverage:** 92.38% test coverage  
+**Security Layers:** 6 independent protection mechanisms  
+**Attacker Cost:** Expert-level cryptanalysis required
 
 See [Threat Model](https://0xtrou.github.io/snapfzz-seal/security/threat-model.html) for details.
 

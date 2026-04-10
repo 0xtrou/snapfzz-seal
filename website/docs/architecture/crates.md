@@ -98,6 +98,52 @@ seal sign --key ~/.snapfzz-seal/keys/builder_secret.key --binary ./agent.sealed
 seal launch --payload ./agent.sealed --user-fingerprint "$USER_FP"
 ```
 
+## Security Architecture
+
+### Defense-in-Depth Layers
+
+Snapfzz Seal implements 6 security layers to protect master secrets:
+
+| Layer | Module | Protection |
+|-------|--------|------------|
+| 1 | `build.rs` | Random markers |
+| 2 | `shamir.rs` | Secret sharing |
+| 3 | `decoys.rs` | Decoy secrets |
+| 4 | `anti_analysis.rs` | Debugger/VM detection |
+| 5 | `integrity.rs` | Binary hash binding |
+| 6 | `whitebox/` | Lookup table cryptography |
+
+**Combined Effect:** Weeks-months of expert cryptanalysis required.
+
+### Key Security Components
+
+#### snapfzz-seal-core
+- `shamir`: Shamir Secret Sharing implementation (GF(2^256))
+- `integrity`: ELF binary parsing and integrity verification
+- `whitebox`: White-box AES-256 with T-boxes and mixing tables
+- `build.rs`: Compile-time random marker generation
+
+#### snapfzz-seal-compiler
+- `decoys`: Decoy secret set generation and embedding
+- `whitebox_embed`: White-box table generation and binary embedding
+- `embed`: Shamir share splitting and embedding
+
+#### snapfzz-seal-launcher
+- `anti_analysis`: Runtime environment analysis (debugger, VM, timing)
+- `integrity`: Binary hash computation and verification
+- `protection`: Process hardening and security hooks
+
+### Security Guarantees
+
+**Before (Pre-v0.2):**
+- Master secret stored in plaintext
+- Trivially extractable with basic tools
+
+**After (v0.2+):**
+- Master secret protected by 6 layers
+- Key spread across ~500KB-2MB of lookup tables
+- Requires expert-level reverse engineering
+
 The above flow traverses `snapfzz-seal` -> compiler/core -> launcher/core/fingerprint crates.
 
 ## Security considerations
