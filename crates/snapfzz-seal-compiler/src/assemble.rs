@@ -10,7 +10,7 @@ use snapfzz_seal_core::{
         find_integrity_regions,
     },
     payload::{pack_payload_with_mode, write_footer},
-    types::{AgentMode, LAUNCHER_PAYLOAD_SENTINEL, PayloadFooter},
+    types::{AgentMode, BackendType, LAUNCHER_PAYLOAD_SENTINEL, PayloadFooter},
 };
 use std::{io::Cursor, path::PathBuf};
 
@@ -21,6 +21,16 @@ pub struct AssembleConfig {
     pub stable_fingerprint_hash: [u8; 32],
     pub user_fingerprint: [u8; 32],
     pub mode: AgentMode,
+    pub backend_name: String,
+}
+
+fn backend_type_from_name(name: &str) -> BackendType {
+    match name {
+        "go" => BackendType::Go,
+        "pyinstaller" => BackendType::PyInstaller,
+        "nuitka" => BackendType::Nuitka,
+        _ => BackendType::Unknown,
+    }
 }
 
 pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
@@ -58,9 +68,12 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     let regions = find_integrity_regions(&launcher_with_whitebox)?;
     let launcher_hash = compute_binary_integrity_hash(&launcher_with_whitebox, &regions)?;
 
+    let backend_type = backend_type_from_name(&config.backend_name);
+
     let footer = PayloadFooter {
         original_hash,
         launcher_hash,
+        backend_type,
     };
     let footer_bytes = write_footer(&footer);
 
@@ -132,6 +145,7 @@ mod tests {
             stable_fingerprint_hash: [2_u8; 32],
             user_fingerprint: [3_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "go".to_string(),
         };
 
         let assembled = assemble(&config).expect("assembly should succeed");
@@ -159,7 +173,12 @@ mod tests {
 
         assert!(assembled.len() > launcher_bytes.len());
 
-        let footer_size = 64;
+        let footer_size = write_footer(&PayloadFooter {
+            original_hash: [0_u8; 32],
+            launcher_hash: [0_u8; 32],
+            backend_type: BackendType::Unknown,
+        })
+        .len();
         let launcher_len = assembled.len()
             - expected_payload.len()
             - LAUNCHER_PAYLOAD_SENTINEL.len()
@@ -207,6 +226,7 @@ mod tests {
             stable_fingerprint_hash,
             user_fingerprint,
             mode: AgentMode::Batch,
+            backend_name: "pyinstaller".to_string(),
         };
 
         let assembled = assemble(&config).expect("assembly should succeed");
@@ -231,7 +251,12 @@ mod tests {
         )
         .expect("payload packing should succeed")
         .len();
-        let footer_len = 64;
+        let footer_len = write_footer(&PayloadFooter {
+            original_hash: [0_u8; 32],
+            launcher_hash: [0_u8; 32],
+            backend_type: BackendType::Unknown,
+        })
+        .len();
         let payload_start = assembled.len() - payload_len - footer_len;
         assert_eq!(
             &assembled[payload_start - LAUNCHER_PAYLOAD_SENTINEL.len()..payload_start],
@@ -266,10 +291,17 @@ mod tests {
             stable_fingerprint_hash: [5_u8; 32],
             user_fingerprint: [6_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "nuitka".to_string(),
         };
 
         let assembled = assemble(&config).expect("assembly should succeed");
-        let footer_bytes = &assembled[assembled.len() - 64..];
+        let footer_size = write_footer(&PayloadFooter {
+            original_hash: [0_u8; 32],
+            launcher_hash: [0_u8; 32],
+            backend_type: BackendType::Unknown,
+        })
+        .len();
+        let footer_bytes = &assembled[assembled.len() - footer_size..];
         let footer = read_footer(footer_bytes).expect("footer should parse");
 
         let mut expected_original_hash = [0_u8; 32];
@@ -282,6 +314,7 @@ mod tests {
         let expected_footer = PayloadFooter {
             original_hash: footer.original_hash,
             launcher_hash: footer.launcher_hash,
+            backend_type: BackendType::Nuitka,
         };
         assert_eq!(footer, expected_footer);
     }
@@ -303,6 +336,7 @@ mod tests {
             stable_fingerprint_hash: [2_u8; 32],
             user_fingerprint: [3_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "go".to_string(),
         })
         .expect_err("launcher without markers should fail embedding");
 
@@ -331,10 +365,13 @@ mod tests {
             stable_fingerprint_hash: [8_u8; 32],
             user_fingerprint: [9_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "go".to_string(),
         };
 
         let assembled = assemble(&config).expect("assembly should succeed");
-        let footer = read_footer(&assembled[assembled.len() - 64..]).expect("footer should parse");
+        let footer_size = 65; // FOOTER_SIZE = HASH_SIZE + HASH_SIZE + 1 (backend_type byte)
+        let footer =
+            read_footer(&assembled[assembled.len() - footer_size..]).expect("footer should parse");
 
         let env_key = derive_env_key(
             &config.master_secret,
@@ -353,8 +390,10 @@ mod tests {
         let encrypted_payload =
             pack_payload_with_mode(Cursor::new(&agent_bytes), &integrity_key, AgentMode::Batch)
                 .expect("payload packing should succeed");
-        let launcher_len =
-            assembled.len() - LAUNCHER_PAYLOAD_SENTINEL.len() - encrypted_payload.len() - 64;
+        let launcher_len = assembled.len()
+            - LAUNCHER_PAYLOAD_SENTINEL.len()
+            - encrypted_payload.len()
+            - footer_size;
         let launcher_with_tamper = &assembled[..launcher_len];
 
         let regions = find_integrity_regions(launcher_with_tamper).expect("regions");
@@ -375,6 +414,7 @@ mod tests {
             stable_fingerprint_hash: [2_u8; 32],
             user_fingerprint: [3_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "go".to_string(),
         })
         .expect_err("missing agent file should surface io error");
 
@@ -396,6 +436,7 @@ mod tests {
             stable_fingerprint_hash: [2_u8; 32],
             user_fingerprint: [3_u8; 32],
             mode: AgentMode::Batch,
+            backend_name: "go".to_string(),
         })
         .expect_err("missing launcher file should surface io error");
 

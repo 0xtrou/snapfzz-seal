@@ -50,7 +50,7 @@ run_full_test() {
         --user-fingerprint "$USER_FP" \
         --sandbox-fingerprint auto \
         --output "$output_file" \
-        --launcher /usr/local/bin/seal-launcher \
+        --launcher "$WORKSPACE_ROOT/target/release/seal-launcher" \
         --backend "$backend" 2>&1; then
         echo "ERROR: Compilation failed for $backend"
         FAILED_BACKENDS="$FAILED_BACKENDS $backend"
@@ -145,25 +145,27 @@ run_full_test() {
 
 # === Test all backends ===
 
+WORKSPACE_ROOT="${WORKSPACE_ROOT:-/app}"
+
 # PyInstaller
 if command -v pyinstaller &> /dev/null; then
-    run_full_test "pyinstaller" "/app/examples/chat_agent" || true
+    run_full_test "pyinstaller" "$WORKSPACE_ROOT/examples/chat_agent" || true
 else
     pip3 install pyinstaller 2>/dev/null
-    run_full_test "pyinstaller" "/app/examples/chat_agent" || true
+    run_full_test "pyinstaller" "$WORKSPACE_ROOT/examples/chat_agent" || true
 fi
 
 # Nuitka
 if command -v nuitka &> /dev/null; then
-    run_full_test "nuitka" "/app/examples/chat_agent" || true
+    run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
 else
     pip3 install nuitka 2>/dev/null
-    run_full_test "nuitka" "/app/examples/chat_agent" || true
+    run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
 fi
 
 # Go
 if command -v go &> /dev/null; then
-    run_full_test "go" "/app/examples/go_agent" || true
+    run_full_test "go" "$WORKSPACE_ROOT/examples/go_agent" || true
 else
     echo "Go not installed, skipping Go backend test"
 fi

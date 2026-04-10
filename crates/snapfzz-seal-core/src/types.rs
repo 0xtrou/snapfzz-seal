@@ -54,6 +54,38 @@ pub struct ChunkRecord {
 pub struct PayloadFooter {
     pub original_hash: [u8; 32],
     pub launcher_hash: [u8; 32],
+    pub backend_type: BackendType,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum BackendType {
+    Unknown = 0,
+    Go = 1,
+    PyInstaller = 2,
+    Nuitka = 3,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        BackendType::Unknown
+    }
+}
+
+impl BackendType {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Unknown),
+            1 => Some(Self::Go),
+            2 => Some(Self::PyInstaller),
+            3 => Some(Self::Nuitka),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -155,6 +187,7 @@ mod tests {
         let footer = PayloadFooter {
             original_hash: [0x11; 32],
             launcher_hash: [0x22; 32],
+            backend_type: BackendType::Go,
         };
 
         let serialized = write_footer(&footer);
@@ -168,12 +201,29 @@ mod tests {
         let footer = PayloadFooter {
             original_hash: [0xAA; 32],
             launcher_hash: [0xBB; 32],
+            backend_type: BackendType::PyInstaller,
         };
 
         let serialized = write_footer(&footer);
 
         assert_eq!(&serialized[..32], &[0xAA; 32]);
-        assert_eq!(&serialized[32..], &[0xBB; 32]);
+        assert_eq!(&serialized[32..64], &[0xBB; 32]);
+        assert_eq!(serialized[64], BackendType::PyInstaller.as_u8());
+    }
+
+    #[test]
+    fn backend_type_default_and_type_conversions_cover_valid_and_invalid_values() {
+        assert_eq!(BackendType::default(), BackendType::Unknown);
+        assert_eq!(BackendType::Unknown.as_u8(), 0);
+        assert_eq!(BackendType::Go.as_u8(), 1);
+        assert_eq!(BackendType::PyInstaller.as_u8(), 2);
+        assert_eq!(BackendType::Nuitka.as_u8(), 3);
+        assert_eq!(BackendType::from_u8(0), Some(BackendType::Unknown));
+        assert_eq!(BackendType::from_u8(1), Some(BackendType::Go));
+        assert_eq!(BackendType::from_u8(2), Some(BackendType::PyInstaller));
+        assert_eq!(BackendType::from_u8(3), Some(BackendType::Nuitka));
+        assert_eq!(BackendType::from_u8(4), None);
+        assert_eq!(BackendType::from_u8(u8::MAX), None);
     }
 
     #[test]

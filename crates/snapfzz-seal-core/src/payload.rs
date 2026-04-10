@@ -2,7 +2,7 @@ use crate::{
     constants::{CHUNK_SIZE, ENC_ALG_AES256_GCM, FMT_STREAM, MAGIC_BYTES, VERSION_V1},
     crypto::{decrypt_stream, encrypt_stream},
     error::SealError,
-    types::{AgentMode, PayloadFooter, PayloadHeader},
+    types::{AgentMode, BackendType, PayloadFooter, PayloadHeader},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -13,7 +13,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 const HEADER_SIZE: usize = 4 + 2 + 2 + 2 + 4 + 32;
 const MODE_SIZE: usize = 1;
-const FOOTER_SIZE: usize = 64;
+const HASH_SIZE: usize = 32;
+const FOOTER_SIZE: usize = HASH_SIZE + HASH_SIZE + 1;
+const LEGACY_FOOTER_SIZE: usize = HASH_SIZE + HASH_SIZE;
 const NONCE_SIZE: usize = 7;
 
 pub fn pack_payload(mut plaintext: impl Read, key: &[u8; 32]) -> Result<Vec<u8>, SealError> {
@@ -122,27 +124,40 @@ pub fn validate_payload_header(data: &[u8]) -> Result<PayloadHeader, SealError> 
 
 pub fn write_footer(footer: &PayloadFooter) -> [u8; FOOTER_SIZE] {
     let mut out = [0_u8; FOOTER_SIZE];
-    out[..32].copy_from_slice(&footer.original_hash);
-    out[32..].copy_from_slice(&footer.launcher_hash);
+    out[..HASH_SIZE].copy_from_slice(&footer.original_hash);
+    out[HASH_SIZE..HASH_SIZE * 2].copy_from_slice(&footer.launcher_hash);
+    out[HASH_SIZE * 2] = footer.backend_type.as_u8();
     out
 }
 
 pub fn read_footer(data: &[u8]) -> Result<PayloadFooter, SealError> {
-    if data.len() != FOOTER_SIZE {
+    if data.len() != FOOTER_SIZE && data.len() != LEGACY_FOOTER_SIZE {
         return Err(SealError::InvalidPayload(format!(
-            "payload footer must be exactly {FOOTER_SIZE} bytes"
+            "payload footer must be exactly {FOOTER_SIZE} bytes or legacy {LEGACY_FOOTER_SIZE} bytes"
         )));
     }
 
-    let mut original_hash = [0_u8; 32];
-    original_hash.copy_from_slice(&data[..32]);
+    let mut original_hash = [0_u8; HASH_SIZE];
+    original_hash.copy_from_slice(&data[..HASH_SIZE]);
 
-    let mut launcher_hash = [0_u8; 32];
-    launcher_hash.copy_from_slice(&data[32..]);
+    let mut launcher_hash = [0_u8; HASH_SIZE];
+    launcher_hash.copy_from_slice(&data[HASH_SIZE..HASH_SIZE * 2]);
+
+    let backend_type = if data.len() == FOOTER_SIZE {
+        BackendType::from_u8(data[HASH_SIZE * 2]).ok_or_else(|| {
+            SealError::InvalidPayload(format!(
+                "invalid payload backend type byte: {}",
+                data[HASH_SIZE * 2]
+            ))
+        })?
+    } else {
+        BackendType::Unknown
+    };
 
     Ok(PayloadFooter {
         original_hash,
         launcher_hash,
+        backend_type,
     })
 }
 
@@ -474,13 +489,15 @@ mod tests {
     #[test]
     fn read_footer_parses_hash_halves_in_order() {
         let mut bytes = [0_u8; FOOTER_SIZE];
-        bytes[..32].copy_from_slice(&[0x12; 32]);
-        bytes[32..].copy_from_slice(&[0x34; 32]);
+        bytes[..HASH_SIZE].copy_from_slice(&[0x12; 32]);
+        bytes[HASH_SIZE..HASH_SIZE * 2].copy_from_slice(&[0x34; 32]);
+        bytes[HASH_SIZE * 2] = BackendType::PyInstaller.as_u8();
 
         let footer = read_footer(&bytes).expect("footer should parse");
 
         assert_eq!(footer.original_hash, [0x12; 32]);
         assert_eq!(footer.launcher_hash, [0x34; 32]);
+        assert_eq!(footer.backend_type, BackendType::PyInstaller);
     }
 
     #[test]
@@ -587,17 +604,19 @@ mod tests {
     }
 
     #[test]
-    fn write_footer_produces_exactly_64_bytes() {
+    fn write_footer_produces_exactly_65_bytes() {
         let footer = PayloadFooter {
             original_hash: [0x11; 32],
             launcher_hash: [0x22; 32],
+            backend_type: BackendType::Nuitka,
         };
 
         let bytes = write_footer(&footer);
 
         assert_eq!(bytes.len(), FOOTER_SIZE);
-        assert_eq!(&bytes[..32], &[0x11; 32]);
-        assert_eq!(&bytes[32..], &[0x22; 32]);
+        assert_eq!(&bytes[..HASH_SIZE], &[0x11; 32]);
+        assert_eq!(&bytes[HASH_SIZE..HASH_SIZE * 2], &[0x22; 32]);
+        assert_eq!(bytes[HASH_SIZE * 2], BackendType::Nuitka.as_u8());
     }
 
     #[test]
@@ -605,6 +624,7 @@ mod tests {
         let footer = PayloadFooter {
             original_hash: [0x33; 32],
             launcher_hash: [0x44; 32],
+            backend_type: BackendType::Go,
         };
 
         let bytes = write_footer(&footer);
@@ -614,15 +634,38 @@ mod tests {
     }
 
     #[test]
-    fn read_footer_rejects_shorter_than_64_bytes() {
-        let err = read_footer(&[0xAA; FOOTER_SIZE - 1]).expect_err("short footer must fail");
+    fn read_footer_rejects_shorter_than_legacy_footer_size() {
+        let err = read_footer(&[0xAA; LEGACY_FOOTER_SIZE - 1]).expect_err("short footer must fail");
         assert!(matches!(err, SealError::InvalidPayload(_)));
     }
 
     #[test]
-    fn read_footer_rejects_longer_than_64_bytes() {
+    fn read_footer_rejects_longer_than_current_footer_size() {
         let err = read_footer(&[0xBB; FOOTER_SIZE + 1]).expect_err("long footer must fail");
         assert!(matches!(err, SealError::InvalidPayload(_)));
+    }
+
+    #[test]
+    fn read_footer_accepts_legacy_64_byte_footer_as_unknown_backend() {
+        let mut bytes = [0_u8; LEGACY_FOOTER_SIZE];
+        bytes[..HASH_SIZE].copy_from_slice(&[0xAA; HASH_SIZE]);
+        bytes[HASH_SIZE..HASH_SIZE * 2].copy_from_slice(&[0xBB; HASH_SIZE]);
+
+        let footer = read_footer(&bytes).expect("legacy footer should parse");
+        assert_eq!(footer.original_hash, [0xAA; HASH_SIZE]);
+        assert_eq!(footer.launcher_hash, [0xBB; HASH_SIZE]);
+        assert_eq!(footer.backend_type, BackendType::Unknown);
+    }
+
+    #[test]
+    fn read_footer_rejects_invalid_backend_type_byte() {
+        let mut bytes = [0_u8; FOOTER_SIZE];
+        bytes[HASH_SIZE * 2] = u8::MAX;
+
+        let err = read_footer(&bytes).expect_err("invalid backend type must fail");
+        assert!(
+            matches!(err, SealError::InvalidPayload(message) if message.contains("invalid payload backend type byte"))
+        );
     }
 
     #[test]

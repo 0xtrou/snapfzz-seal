@@ -87,6 +87,8 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         CliBackend::Go => Box::new(GoBackend),
     };
 
+    let backend_name = backend.name().to_string();
+
     let compiled_binary =
         compile::compile_agent_with_backend(&cli.project, &output_parent, backend.as_ref())?;
 
@@ -97,6 +99,7 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         stable_fingerprint_hash,
         user_fingerprint,
         mode: cli.mode.into(),
+        backend_name,
     })?;
 
     std::fs::write(&cli.output, &assembled)?;

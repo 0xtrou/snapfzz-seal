@@ -13,6 +13,7 @@ pub extern "C" fn snapfzz_launcher_markers_ptr() -> *const markers::LauncherMark
 }
 mod memfd_exec;
 mod protection;
+mod temp_exec;
 #[allow(dead_code)]
 mod self_delete;
 mod seccomp;
@@ -21,6 +22,7 @@ mod integrity;
 
 use std::io::Cursor;
 
+use crate::temp_exec::TempFileExecutor;
 use clap::{Parser, ValueEnum};
 pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
 #[cfg(target_os = "linux")]
@@ -33,13 +35,14 @@ use snapfzz_seal_core::{
     shamir::reconstruct_secret,
     signing,
     types::{
-        LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_TAMPER_MARKER, PayloadFooter, SHAMIR_THRESHOLD,
-        SHAMIR_TOTAL_SHARES, get_secret_marker,
+        BackendType, LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_TAMPER_MARKER, PayloadFooter,
+        SHAMIR_THRESHOLD, SHAMIR_TOTAL_SHARES, get_secret_marker,
     },
 };
 use snapfzz_seal_fingerprint::{
     FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
 };
+pub use temp_exec::InteractiveHandle as TempInteractiveHandle;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -101,8 +104,8 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     let raw_binary = load_raw_binary(cli.payload.as_deref())?;
 
     // Strip signature block BEFORE extracting payload/footer so offsets are correct.
-    // Binary layout: [launcher | sentinel | encrypted_payload | footer(64) | sig_block(100)]
-    // After stripping: [launcher | sentinel | encrypted_payload | footer(64)]
+    // Binary layout: [launcher | sentinel | encrypted_payload | footer(65) | sig_block(100)]
+    // After stripping: [launcher | sentinel | encrypted_payload | footer(65)]
     let raw_no_sig = strip_signature_block(&raw_binary);
     let payload_bytes = extract_payload_from_assembled_binary(raw_no_sig)?;
 
@@ -153,7 +156,7 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     )?;
 
     // Strip footer from payload before decryption (footer is NOT encrypted)
-    const FOOTER_SIZE: usize = 64;
+    const FOOTER_SIZE: usize = 65;
     if payload_bytes.len() < FOOTER_SIZE {
         return Err(SealError::InvalidPayload(
             "payload too small to contain footer".to_string(),
@@ -182,7 +185,6 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         cleanup::self_delete()?;
     }
 
-    let executor = MemfdExecutor::new(KernelMemfdOps);
     let config = ExecConfig {
         args: Vec::new(),
         env: Vec::new(),
@@ -192,7 +194,26 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         max_output_bytes: Some(64 * 1024 * 1024),
     };
 
-    let result = executor.execute(decrypted.as_slice(), &config)?;
+    let backend_type = footer.backend_type;
+    let result = match backend_type {
+        BackendType::Go => {
+            let executor = MemfdExecutor::new(KernelMemfdOps);
+            executor.execute(decrypted.as_slice(), &config)?
+        }
+        BackendType::PyInstaller | BackendType::Nuitka => {
+            let executor = TempFileExecutor::new();
+            executor.execute(decrypted.as_slice(), &config)?
+        }
+        BackendType::Unknown => {
+            let executor = MemfdExecutor::new(KernelMemfdOps);
+            executor
+                .execute(decrypted.as_slice(), &config)
+                .or_else(|_| {
+                    tracing::warn!("memfd exec failed for unknown backend, using temp-file");
+                    TempFileExecutor::new().execute(decrypted.as_slice(), &config)
+                })?
+        }
+    };
     let json = serde_json::to_string(&result).map_err(|err| {
         SealError::InvalidInput(format!("failed to serialize execution result: {err}"))
     })?;
@@ -291,13 +312,15 @@ fn load_raw_binary(payload_arg: Option<&str>) -> Result<Vec<u8>, SealError> {
 }
 
 pub fn extract_footer(payload_bytes: &[u8]) -> Result<PayloadFooter, SealError> {
-    if payload_bytes.len() < 64 {
+    const FOOTER_SIZE: usize = 65;
+
+    if payload_bytes.len() < FOOTER_SIZE {
         return Err(SealError::InvalidPayload(
             "payload too small to contain footer".to_string(),
         ));
     }
 
-    let footer_start = payload_bytes.len() - 64;
+    let footer_start = payload_bytes.len() - FOOTER_SIZE;
     read_footer(&payload_bytes[footer_start..])
 }
 
@@ -764,6 +787,7 @@ mod tests {
         let footer = PayloadFooter {
             original_hash: [0x11; 32],
             launcher_hash: [0x22; 32],
+            backend_type: BackendType::Go,
         };
         let mut payload_bytes = b"ASL\x01encrypted-payload".to_vec();
         payload_bytes.extend_from_slice(&write_footer(&footer));
@@ -784,6 +808,7 @@ mod tests {
         let footer = PayloadFooter {
             original_hash: [0x33; 32],
             launcher_hash: [0x44; 32],
+            backend_type: BackendType::PyInstaller,
         };
         let footer_bytes = write_footer(&footer);
 

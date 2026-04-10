@@ -207,6 +207,77 @@ When `--backend` is omitted, defaults to `nuitka`.
 | Nuitka | Slow (2-10m) | Medium (30-100MB) | Fast (native) |
 | Go | Fast (10s-1m) | Small (10-50MB) | Fast (native) |
 
+## Execution Modes
+
+Different backends use different execution strategies based on their technical requirements:
+
+### Memory Execution (Go Backend)
+
+**Backend**: Go
+
+**Execution Mode**: `memfd` — in-memory execution via file descriptor
+
+**How it works**:
+- Launcher creates anonymous memory file (`memfd_create`)
+- Decrypts payload into memory
+- Executes directly from memory via `fexecve`
+- No disk files created during execution
+
+**Security advantages**:
+- ✅ Zero disk artifacts — no temp files
+- ✅ No forensic recovery — deleted immediately after use
+- ✅ Maximum stealth — process appears only in memory
+
+**Technical requirement**:
+- Go binaries are statically-linked ELF executables
+- Can execute from memory file descriptors without filesystem dependencies
+
+### Temp-File Execution (Python Backends)
+
+**Backends**: PyInstaller, Nuitka
+
+**Execution Mode**: temp-file with immediate unlink
+
+**How it works**:
+- Launcher creates temp file in `/dev/shm` (RAM filesystem)
+- Decrypts payload to temp file
+- Immediately unlinks file (removes from filesystem)
+- Executes via fork/exec
+- File exists only briefly during execution
+
+**Security characteristics**:
+- ⚠️ Brief disk visibility during execution
+- ✅ Immediate unlink prevents persistence
+- ⚠️ Forensic recovery possible during active execution
+
+**Technical requirement**:
+- Python bundlers (PyInstaller, Nuitka) use bootloader that reads attached data via `fopen()`
+- Bootloader needs real filesystem path for `/proc/self/exe` → PKG archive access
+- Cannot use memfd execution (bootloader incompatible)
+
+### Why Different Modes?
+
+**Root cause**: Python bootloader architecture
+
+PyInstaller and Nuitka embed payload data inside the executable:
+1. Bootloader reads `/proc/self/exe` path
+2. Opens executable with `fopen()` to read attached PKG archive
+3. Memory file descriptors (`/memfd:snapfzz-seal-payload`) cannot be reopened with `fopen()`
+
+**Trade-off table**:
+
+| Execution Mode | Disk Visibility | Persistence | Forensic Recovery |
+|----------------|-----------------|-------------|-------------------|
+| memfd (Go) | NONE | NONE | IMPOSSIBLE |
+| temp-file (Python) | MEDIUM (brief `/dev/shm` visible) | LOW (immediate unlink) | LOW (possible during execution) |
+
+**Mitigations for temp-file execution**:
+- `/dev/shm` preferred over `/tmp` (RAM filesystem)
+- `O_EXCL | O_CREAT` prevents symlink attacks
+- Random UUID filename prevents prediction
+- Immediate unlink after fork
+- `PDEATHSIG` terminates child if launcher dies
+
 ## Troubleshooting
 
 ### Backend Tool Not Found
