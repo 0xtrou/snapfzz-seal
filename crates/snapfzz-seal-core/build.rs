@@ -5,7 +5,7 @@ fn derive_marker(build_id: &str, label: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(build_id.as_bytes());
     hasher.update(label);
-    hasher.update(rand::random::<[u8; 16]>());
+    hasher.update(b"deterministic_marker_v1");
     hasher.finalize().into()
 }
 
@@ -51,7 +51,7 @@ fn main() {
     writeln!(
         file,
         "pub const POSITION_HINT_SALT: [u8; 32] = {:?};",
-        rand::random::<[u8; 32]>()
+        derive_marker(&build_id, b"position_hint_salt")
     )
     .expect("must write position hint salt");
 

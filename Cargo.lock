@@ -1950,6 +1950,7 @@ dependencies = [
 name = "snapfzz-seal-launcher"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "hex",
  "libc",
@@ -1959,6 +1960,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "sha2",
  "snapfzz-seal-core",
  "snapfzz-seal-fingerprint",
  "tracing",

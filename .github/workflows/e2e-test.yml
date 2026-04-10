@@ -66,6 +66,8 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Build release
+        env:
+          BUILD_ID: ${{ github.sha }}
         run: cargo build --release -p snapfzz-seal -p snapfzz-seal-launcher
 
       - name: Verify binaries exist
@@ -290,6 +292,7 @@ jobs:
             --sandbox-fingerprint "$SANDBOX_FP" \
             --output /tmp/agent-go.sealed \
             --launcher ./target/release/seal-launcher \
+            --backend go \
             --mode batch
           
           # Sign

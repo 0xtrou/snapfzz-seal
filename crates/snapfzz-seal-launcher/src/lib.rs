@@ -5,6 +5,7 @@ mod anti_analysis;
 #[allow(dead_code)]
 mod anti_debug;
 mod cleanup;
+mod markers;
 mod memfd_exec;
 mod protection;
 #[allow(dead_code)]
