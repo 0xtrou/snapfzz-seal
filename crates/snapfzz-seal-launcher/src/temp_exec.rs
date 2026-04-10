@@ -43,6 +43,15 @@ pub struct InteractiveHandle {
     grace_period: Duration,
     heartbeat_timeout: Duration,
     max_output_bytes: usize,
+    temp_path: Option<PathBuf>,
+}
+
+impl Drop for InteractiveHandle {
+    fn drop(&mut self) {
+        if let Some(path) = &self.temp_path {
+            let _ = unlink(path);
+        }
+    }
 }
 
 impl TempFileExecutor {
@@ -67,6 +76,9 @@ impl TempFileExecutor {
         #[cfg(target_os = "linux")]
         {
             let temp_file = create_payload_temp_file(binary_data)?;
+            let temp_path = temp_file.path.clone();
+            drop(temp_file.fd);
+
             let (stdout_read, stdout_write) =
                 pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
             let (stderr_read, stderr_write) =
@@ -93,14 +105,11 @@ impl TempFileExecutor {
                     drop(stdout_write);
                     drop(stderr_write);
 
-                    run_temp_child(temp_file.fd, config);
+                    run_temp_child_exec(temp_path, config);
                 }
                 ForkResult::Parent { child } => {
                     drop(stdout_write);
                     drop(stderr_write);
-
-                    unlink(&temp_file.path)
-                        .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
 
                     let max_output_bytes = max_output_bytes(config);
                     let stdout_handle = std::thread::spawn(move || {
@@ -118,6 +127,8 @@ impl TempFileExecutor {
                     })??;
 
                     let wait_status = wait_for_child_exit(child)?;
+
+                    unlink(&temp_path).map_err(|err| SealError::Io(std::io::Error::from(err)))?;
 
                     Ok(ExecutionResult {
                         exit_code: extract_exit_code(wait_status),
@@ -146,6 +157,9 @@ impl TempFileExecutor {
         #[cfg(target_os = "linux")]
         {
             let temp_file = create_payload_temp_file(binary_data)?;
+            let temp_path = temp_file.path.clone();
+            drop(temp_file.fd);
+
             let (stdin_read, stdin_write) =
                 pipe().map_err(|err| SealError::Io(std::io::Error::from(err)))?;
             let (stdout_read, stdout_write) =
@@ -179,15 +193,12 @@ impl TempFileExecutor {
                     drop(stdout_write);
                     drop(stderr_write);
 
-                    run_temp_child(temp_file.fd, config);
+                    run_temp_child_exec(temp_path, config);
                 }
                 ForkResult::Parent { child } => {
                     drop(stdin_read);
                     drop(stdout_write);
                     drop(stderr_write);
-
-                    unlink(&temp_file.path)
-                        .map_err(|err| SealError::Io(std::io::Error::from(err)))?;
 
                     Ok(InteractiveHandle {
                         child_pid: child.as_raw() as u32,
@@ -198,6 +209,7 @@ impl TempFileExecutor {
                         grace_period: Duration::from_secs(config.grace_period_secs),
                         heartbeat_timeout: heartbeat_timeout_from_env(),
                         max_output_bytes: max_output_bytes(config),
+                        temp_path: Some(temp_path),
                     })
                 }
             }
@@ -450,7 +462,7 @@ struct TempFileArtifact {
     fd: OwnedFd,
 }
 
-fn run_temp_child(fd: OwnedFd, config: &ExecConfig) -> ! {
+fn run_temp_child_exec(temp_path: PathBuf, config: &ExecConfig) -> ! {
     #[allow(clippy::collapsible_if)]
     if let Some(cwd) = &config.cwd {
         if let Err(err) = std::env::set_current_dir(cwd) {
@@ -492,7 +504,7 @@ fn run_temp_child(fd: OwnedFd, config: &ExecConfig) -> ! {
     let exec_result = (|| -> Result<(), SealError> {
         let argv = build_argv(config)?;
         let envp = build_envp(config)?;
-        exec_fd_path(&fd, &argv, &envp)
+        exec_path(&temp_path, &argv, &envp)
     })();
 
     if let Err(err) = exec_result {
@@ -504,8 +516,8 @@ fn run_temp_child(fd: OwnedFd, config: &ExecConfig) -> ! {
     }
 }
 
-fn exec_fd_path(fd: &OwnedFd, argv: &[CString], envp: &[CString]) -> Result<(), SealError> {
-    let exec_path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+fn exec_path(path: &Path, argv: &[CString], envp: &[CString]) -> Result<(), SealError> {
+    let exec_path = CString::new(path.to_string_lossy().into_owned())
         .map_err(|err| SealError::InvalidInput(format!("invalid exec path: {err}")))?;
 
     let mut argv_ptrs: Vec<*const nix::libc::c_char> =
@@ -553,11 +565,61 @@ fn create_payload_temp_file(binary_data: &[u8]) -> Result<TempFileArtifact, Seal
 }
 
 fn select_temp_base_dir() -> PathBuf {
-    if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        PathBuf::from("/tmp")
+    if dir_allows_exec("/dev/shm") {
+        return PathBuf::from("/dev/shm");
     }
+
+    if Path::new("/tmp").is_dir() {
+        return PathBuf::from("/tmp");
+    }
+
+    if Path::new("/dev/shm").is_dir() {
+        return PathBuf::from("/dev/shm");
+    }
+
+    PathBuf::from("/tmp")
+}
+
+fn dir_allows_exec(path: &str) -> bool {
+    if !Path::new(path).is_dir() {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if mount_point_has_noexec(path) {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn mount_point_has_noexec(mount_point: &str) -> bool {
+    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+        return false;
+    };
+
+    mount_point_has_noexec_in_mounts(&mounts, mount_point)
+}
+
+#[cfg(target_os = "linux")]
+fn mount_point_has_noexec_in_mounts(mounts: &str, mount_point: &str) -> bool {
+    mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _source = fields.next();
+        let mount = fields.next();
+        let _fstype = fields.next();
+        let options = fields.next();
+
+        match (mount, options) {
+            (Some(mount), Some(options)) if mount == mount_point => {
+                options.split(',').any(|opt| opt == "noexec")
+            }
+            _ => false,
+        }
+    })
 }
 
 fn open_secure_payload_file(path: &Path) -> Result<OwnedFd, SealError> {
