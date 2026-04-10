@@ -463,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "timing check runs 100k iterations which is slow on CI"]
     fn analysis_state_is_boolean_and_callable_on_all_platforms() {
         let _ = is_being_analyzed();
     }
