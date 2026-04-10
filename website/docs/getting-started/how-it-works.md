@@ -52,11 +52,11 @@ The payload packer creates:
 
 The launcher binary is read and patched with marker-based embed operations:
 
-- **Layer 1**: Random marker generation (build time)
-- **Layer 2**: Shamir secret share embedding (5 shares, 3 threshold)
-- **Layer 3**: Decoy secret set embedding (10 fake sets)
-- **Layer 5**: Launcher tamper hash replacement
-- **Layer 6**: White-box table embedding (~165KB)
+- **Layer 1**: Marker generation from BUILD_ID (build time) ✅
+- **Layer 2**: Shamir secret share embedding (5 shares, 3 threshold) ✅
+- **Layer 3**: Decoy marker generation ⚠️ (generated, embedding in progress)
+- **Layer 5**: Launcher tamper hash replacement ✅
+- **Layer 6**: White-box table embedding (~165KB) ⚠️ (tables embedded, runtime integration in progress)
 
 The assembled binary is then written as:
 
@@ -67,7 +67,7 @@ The assembled binary is then written as:
 [payload_footer]
 ```
 
-White-box tables are embedded into the launcher binary before the payload sentinel, not appended after the footer.
+White-box tables are embedded into the launcher binary before the payload sentinel.
 
 ### 5. Signing stage
 
@@ -79,14 +79,15 @@ White-box tables are embedded into the launcher binary before the payload sentin
 
 1. Payload header validation
 2. Signature verification
-3. **Layer 4**: Anti-analysis checks (debugger, VM detection)
-4. **Layer 5**: Launcher integrity check against footer hash
+3. **Layer 4**: Anti-analysis checks (debugger, VM detection) ✅
+4. **Layer 5**: Launcher integrity check against footer hash ✅
 5. Runtime fingerprint collection
-6. **Layer 2**: Shamir secret reconstruction (from 3+ shares)
-7. Key derivation with integrity binding
-8. **Layer 6**: White-box decryption using lookup tables
-9. In-memory decrypt
-7. `memfd` execution path
+6. **Layer 2**: Shamir secret reconstruction (from 3+ shares) ✅
+7. Key derivation with integrity binding ✅
+8. In-memory decrypt (currently AES-GCM; white-box integration in progress)
+9. `memfd` execution path
+
+**Note on Layer 6**: White-box tables are generated and embedded during compilation, but the launcher currently uses standard AES-GCM decryption. Full white-box decryption integration is in progress.
 
 ## Cryptographic primitives
 
@@ -127,26 +128,26 @@ Operational notes:
 
 ## Security Architecture
 
-Snapfzz Seal implements defense-in-depth security with 6 protection layers:
+Snapfzz Seal implements defense-in-depth security with multiple protection layers:
 
 ### Layer Breakdown
 
-**Layer 1: No Observable Patterns**
-- Random markers generated at compile time
-- No searchable strings in binary
-- 55 total markers (5 real + 50 decoys)
+**Layer 1: Deterministic Markers ✅**
+- Markers derived from BUILD_ID at compile time
+- 5 real markers + 50 decoy markers
+- Not truly random, but opaque
 
-**Layer 2: Shamir Secret Sharing**
+**Layer 2: Shamir Secret Sharing ✅**
 - Master secret split into 5 shares
 - Requires minimum 3 shares to reconstruct
 - Prime field arithmetic (secp256k1 modulus)
 
-**Layer 3: Decoy Secrets**
-- 10 fake secret sets embedded
+**Layer 3: Decoy Markers ⚠️**
+- 10 decoy marker sets generated
 - Position obfuscation with salt
-- Confuses automated extraction tools
+- **Status**: Generated during compile, embedding in progress
 
-**Layer 4: Anti-Analysis**
+**Layer 4: Anti-Analysis ✅**
 - Debugger detection (ptrace, TracerPid)
 - VM detection (VMware, VirtualBox, QEMU)
 - Timing checks and environment poisoning

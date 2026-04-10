@@ -29,7 +29,7 @@ The launcher binary must be built before compiling agents:
 cargo build --release
 ```
 
-This creates `./target/release/snapfzz-seal-launcher`, which is required for the compile step.
+This creates `./target/release/seal-launcher`, which is required for the compile step.
 
 :::note
 
@@ -61,7 +61,7 @@ seal compile \
   --user-fingerprint "$USER_FP" \
   --sandbox-fingerprint auto \
   --output ./agent.sealed \
-  --launcher ./target/release/snapfzz-seal-launcher
+  --launcher ./target/release/seal-launcher
 ```
 
 Expected output pattern:
@@ -73,7 +73,7 @@ compiled and assembled binary: ./agent.sealed (<N> bytes)
 ### Alternative: Use environment variable for launcher
 
 ```bash
-export SNAPFZZ_SEAL_LAUNCHER_PATH=./target/release/snapfzz-seal-launcher
+export SNAPFZZ_SEAL_LAUNCHER_PATH=./target/release/seal-launcher
 
 seal compile \
   --project ./examples/demo_agent \
@@ -122,14 +122,13 @@ Expected output shape:
 
 ### About SNAPFZZ_SEAL_MASTER_SECRET_HEX
 
-:::note
+:::warning
 
-The `SNAPFZZ_SEAL_MASTER_SECRET_HEX` environment variable is shown in some examples but is **optional for normal usage**.
+The `SNAPFZZ_SEAL_MASTER_SECRET_HEX` environment variable behavior is nuanced:
 
-- **Normal case**: `seal compile` embeds the master secret in the artifact. No env var needed.
-- **Fallback case**: Only needed if the embedded secret is missing or corrupted.
-
-You can omit it in the standard workflow shown above.
+- **Normal case**: `seal compile` embeds the master secret in the launcher region. The launch runtime attempts to extract it from embedded Shamir shares.
+- **Fallback case**: If embedded secret extraction fails (e.g., corrupted artifact, mismatched BUILD_ID), the launcher requires `SNAPFZZ_SEAL_MASTER_SECRET_HEX` as fallback.
+- **Recommendation**: For production, ensure BUILD_ID consistency between launcher build and compiler, or provide the env var as backup.
 
 :::
 

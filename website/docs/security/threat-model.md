@@ -14,42 +14,47 @@ The system is designed to:
 
 ## Defense-in-Depth Security
 
-Snapfzz Seal implements 6 independent security layers to protect master secrets:
+Snapfzz Seal implements multiple security layers to protect master secrets:
 
-### Layer 1: No Observable Patterns
-- Random markers generated at compile time
-- No searchable strings ("SECRET", "MARKER", etc.)
+### Layer 1: Deterministic Markers ✅
+- Markers derived from BUILD_ID at compile time
 - 5 real markers + 50 decoy markers per binary
+- **Note**: Not truly random; derived deterministically from build inputs
 
-### Layer 2: Shamir Secret Sharing
+### Layer 2: Shamir Secret Sharing ✅
 - Master secret split into 5 shares
 - Requires minimum 3 shares to reconstruct
 - Prime field arithmetic (secp256k1 modulus)
+- **Status**: Fully implemented and integrated
 
-### Layer 3: Decoy Secrets
-- 10 fake secret sets
+### Layer 3: Decoy Markers ⚠️
+- 10 decoy marker sets generated
 - Position obfuscation with salt
-- 55 total potential markers in binary
+- **Status**: Markers generated, but not yet embedded as full fake share sets in runtime path
+- **Current limitation**: Does not currently create 55 active extraction barriers
 
-### Layer 4: Anti-Analysis
+### Layer 4: Anti-Analysis ✅
 - Debugger detection (ptrace, TracerPid, breakpoints)
 - VM detection (VMware, VirtualBox, QEMU, Xen)
 - Timing checks and environment poisoning
+- **Status**: Fully implemented
 
-### Layer 5: Integrity Binding
+### Layer 5: Integrity Binding ✅
 - Decryption key depends on binary hash
 - ELF parsing for code/data sections
 - Exclusion of secret regions from hash
+- **Status**: Implemented on Linux; skipped on non-Linux platforms
 
-### Layer 6: White-Box Cryptography
-- Key spread across ~165KB of lookup tables
+### Layer 6: White-Box Cryptography ⚠️
+- ~165KB of lookup tables generated and embedded
 - T-boxes + Type I/II mixing tables
-- No single table reveals the key
-- Requires expert-level cryptanalysis
+- **Status**: Tables implemented and embedded; runtime decryption integration in progress
+- **Current limitation**: Launcher uses standard AES-GCM, not white-box tables
 
 **Security Impact:**
 - Before: Master secret trivially extractable
-- After: Requires expert-level reverse engineering
+- After: Significantly increased extraction effort for Layers 1, 2, 4, 5
+- Layers 3, 6: Implementation complete, runtime integration in progress
 
 ## Adversary model
 

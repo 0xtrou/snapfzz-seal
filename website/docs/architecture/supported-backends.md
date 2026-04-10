@@ -108,29 +108,49 @@ seal compile \
 - Production deployments requiring minimal overhead
 - Agents with computationally intensive workloads
 
-## Backends NOT Exposed via `seal compile`
-
 ### Go Backend
 
-**Status**: Implemented internally, **NOT exposed via `seal compile` CLI**
+**Status**: ✅ Implemented
 
-The Go backend exists in the `snapfzz-seal-compiler` crate but is **not accessible through the user-facing `seal compile` command**.
+Compiles Go agents into statically-linked native executables.
 
-**Why not accessible**:
-- `seal compile` only accepts `--backend nuitka` or `--backend pyinstaller`
-- No `--backend go` option in current `seal` CLI
-- Hardcoded for internal use with `GOOS=linux`, `GOARCH=amd64`
+**Supported platforms**:
+- Linux x86_64, arm64
+- macOS arm64, x86_64 (for build only)
 
-**Technical detail**:
-- The lower-level compiler crate (`snapfzz-seal-compiler`) does expose Go as a backend option
-- However, users interact with `seal compile`, not the compiler crate directly
-- An internal fallback chain (`Nuitka → PyInstaller → Go`) exists but is not user-configurable
+**Features**:
+- ✅ Statically-linked binaries (zero runtime dependencies)
+- ✅ Minimal binary size
+- ✅ Fast execution
+- ❌ NO auto-install (requires pre-installed Go toolchain)
+- ❌ NO `--backend-opts` passthrough
 
-**Do NOT attempt**:
+**Configuration**:
+
 ```bash
-# This will FAIL - go backend not exposed in seal CLI
-seal compile --backend go --project ./agent
+seal compile \
+  --backend go \
+  --project ./my_go_agent \
+  --user-fingerprint "$USER_FP" \
+  --sandbox-fingerprint auto \
+  --output ./agent.sealed
 ```
+
+**Requirements**:
+- Go 1.21 or later
+- `go.mod` file in project root
+
+**Compilation behavior**:
+- Sets `GOOS=linux`, `CGO_ENABLED=0`
+- Auto-detects `GOARCH` from host architecture (arm64 or amd64)
+- Produces statically-linked Linux binary
+
+**Best for**:
+- Performance-critical agents
+- Minimal dependency footprint
+- High-performance networking or compute workloads
+
+---
 
 ## Backends NOT Implemented
 
@@ -157,7 +177,7 @@ There is **no native backend** for sealing pre-compiled binaries.
 Specify backend explicitly:
 
 ```bash
-seal compile --backend <nuitka|pyinstaller> --project ./agent --user-fingerprint "$FP" --sandbox-fingerprint auto --output ./agent.sealed
+seal compile --backend <nuitka|pyinstaller|go> --project ./agent --user-fingerprint "$FP" --sandbox-fingerprint auto --output ./agent.sealed
 ```
 
 ### Default Behavior
@@ -185,6 +205,7 @@ When `--backend` is omitted, defaults to `nuitka`.
 |---------|-----------------|-------------|---------------------|
 | PyInstaller | Fast (30s-2m) | Large (50-200MB) | Slower (interpreter) |
 | Nuitka | Slow (2-10m) | Medium (30-100MB) | Fast (native) |
+| Go | Fast (10s-1m) | Small (10-50MB) | Fast (native) |
 
 ## Troubleshooting
 

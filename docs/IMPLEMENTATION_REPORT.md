@@ -2,12 +2,17 @@
 
 ## Executive Summary
 
-Successfully implemented **5 out of 6 defense-in-depth layers** on branch `feat/enhance-decryption`.
+Implemented **6 defense-in-depth layers** with varying integration status.
 
 **Security Improvement:**
 - **Before:** `grep + dd` = 1 minute extraction
-- **After (Layers 1-5):** 24-40 hours of skilled RE work
-- **With Layer 6 (planned):** Weeks-months of expert cryptanalysis
+- **After (Layers 1-5 runtime):** Significantly raised attacker cost
+- **With Layer 6 (tables generated):** Additional cryptographic protection available
+
+**Layer Status:**
+- ✅ Layers 1, 2, 4, 5: Fully implemented and integrated into runtime
+- ⚠️ Layer 3: Implemented, runtime integration in progress
+- ⚠️ Layer 6: Tables generated and embedded, runtime decryption integration in progress
 
 ---
 
@@ -171,24 +176,33 @@ Successfully implemented **5 out of 6 defense-in-depth layers** on branch `feat/
 
 ---
 
-## ❌ Layer 6: White-Box Cryptography (NOT COMPLETED)
+### ⚠️ Layer 6: White-Box Cryptography (IMPLEMENTED, RUNTIME INTEGRATION IN PROGRESS)
 
-**Status:** Spec created, implementation attempted but not completed
+**Status:** Table generation and embedding implemented, runtime decryption integration in progress
 
-**Complexity:** Very high
-- Requires ~2000+ lines of careful cryptographic code
-- Must implement AES with lookup tables
-- Key spread across 1000+ interdependent tables
-- Needs proper GF(2^8) arithmetic
-- Performance optimization required
+**Implementation:**
+- `crates/snapfzz-seal-core/src/whitebox/aes.rs` (360 lines)
+- `crates/snapfzz-seal-core/src/whitebox/tables.rs` (266 lines)
+- `crates/snapfzz-seal-compiler/src/whitebox_embed.rs` (100 lines)
+- Total: ~631 lines of white-box implementation
 
-**Recommendation:**
-1. **Use existing library** if available (preferred)
-2. **Port from proven implementation** (Chow et al.)
-3. **Get expert review** before deployment
-4. **Extensive testing** with security audit
+**What it does:**
+- Generates T-boxes combining SubBytes + AddRoundKey
+- Creates Type I and Type II mixing tables
+- Produces ~165KB of lookup tables per master key
+- Embeds tables into compiled artifact
 
-**Expected Impact:** Weeks-months attacker time
+**Current Limitation:**
+- Tables are generated and embedded during compilation
+- Runtime launcher currently uses standard AES-GCM decryption
+- Full white-box decryption path integration is in progress
+
+**Next Steps:**
+1. Wire white-box tables into launcher decryption flow
+2. Add performance benchmarks for white-box decrypt
+3. Security audit of table generation implementation
+
+**Expected Impact (when integrated):** Additional cryptographic protection layer
 
 ---
 
@@ -198,11 +212,11 @@ Successfully implemented **5 out of 6 defense-in-depth layers** on branch `feat/
 |-----------|-------|-------|--------|
 | Layer 1: Markers | 3 | ~150 | ✅ Complete |
 | Layer 2: Shamir | 2 | ~650 | ✅ Complete |
-| Layer 3: Decoys | 2 | ~150 | ✅ Complete |
+| Layer 3: Decoys | 2 | ~150 | ⚠️ Partial (embedding in progress) |
 | Layer 4: Anti-Analysis | 2 | ~500 | ✅ Complete |
 | Layer 5: Integrity | 4 | ~550 | ✅ Complete |
-| Layer 6: White-Box | 0 | 0 | ❌ Not done |
-| **Total** | **13** | **~2000** | **83%** |
+| Layer 6: White-Box | 3 | ~631 | ⚠️ Tables done, runtime integration in progress |
+| **Total** | **16** | **~2631** | **4/6 fully integrated** |
 
 ---
 

@@ -41,14 +41,14 @@ seal compile \
     --user-fingerprint "$USER_FP" \
     --sandbox-fingerprint auto \
     --output /tmp/demo.sealed \
-    --launcher ./target/release/snapfzz-seal-launcher \
+    --launcher ./target/release/seal-launcher \
     --mode batch
 
 # 3. Sign
-seal sign --key ./keys/key --binary /tmp/demo.sealed
+seal sign --key ./keys/builder_secret.key --binary /tmp/demo.sealed
 
 # 4. Verify and run
 # --pubkey pins builder identity; omitting it uses TOFU (embedded key)
-seal verify --binary /tmp/demo.sealed --pubkey ./keys/key.pub
+seal verify --binary /tmp/demo.sealed --pubkey ./keys/builder_public.key
 SNAPFZZ_SEAL_MASTER_SECRET_HEX=... /tmp/demo.sealed --user-fingerprint "$USER_FP"
 ```

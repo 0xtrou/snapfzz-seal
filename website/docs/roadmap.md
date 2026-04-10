@@ -4,11 +4,52 @@ sidebar_position: 7
 
 # Roadmap
 
-This document outlines planned features and future development directions for Snapfzz Seal.
+This document outlines implemented features and planned development directions for Snapfzz Seal.
+
+## Currently Implemented
+
+### Compilation Backends
+
+| Backend | Status | Notes |
+|---------|--------|-------|
+| **Nuitka** | ✅ Implemented | Default Python backend |
+| **PyInstaller** | ✅ Implemented | Alternative Python backend |
+| **Go** | ✅ Implemented | `--backend go` available |
+
+### Sandboxes
+
+| Backend | Status | Notes |
+|---------|--------|-------|
+| **Docker** | ✅ Implemented | Primary sandbox backend with hardening |
+
+### Security Features
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Shamir Secret Sharing | ✅ Implemented | 5 shares, threshold 3 |
+| Anti-Analysis | ✅ Implemented | Debugger/VM detection |
+| Integrity Binding | ✅ Implemented | Linux only |
+| White-Box Tables | ⚠️ Partial | Tables generated, runtime integration in progress |
+| Decoy Markers | ⚠️ Partial | Markers generated, embedding in progress |
+
+### CLI Commands
+
+| Command | Status |
+|---------|--------|
+| `seal compile` | ✅ Implemented |
+| `seal launch` | ✅ Implemented |
+| `seal keygen` | ✅ Implemented |
+| `seal sign` | ✅ Implemented |
+| `seal verify` | ✅ Implemented |
+| `seal server` | ✅ Implemented |
+
+---
+
+## Planned Features
 
 :::info
 
-All features listed here are **planned** and not yet implemented. They may change based on research, user feedback, and development priorities.
+Features below are **planned** and not yet implemented. They may change based on research, user feedback, and development priorities.
 
 :::
 

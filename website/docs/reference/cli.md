@@ -28,7 +28,7 @@ seal compile \
   --sandbox-fingerprint <auto|64-hex> \
   --output <path> \
   [--launcher <path>] \
-  [--backend <nuitka|pyinstaller>] \
+  [--backend <nuitka|pyinstaller|go>] \
   [--mode <batch|interactive>]
 ```
 
@@ -39,11 +39,13 @@ Flags:
 - `--sandbox-fingerprint`: `auto` or 32-byte hex value (64 hex characters)
 - `--output`: destination file path
 - `--launcher`: explicit launcher path override (or use `SNAPFZZ_SEAL_LAUNCHER_PATH`)
-- `--backend`: compile backend selection (`nuitka` or `pyinstaller`, default: `nuitka`)
+- `--backend`: compile backend selection (`nuitka`, `pyinstaller`, or `go`; default: `nuitka`)
 - `--mode`: payload mode byte selection (`batch` or `interactive`)
 
-**Requirements**:
-- Backend tool must be pre-installed (`pip install nuitka` or `pip install pyinstaller`)
+**Requirements by backend**:
+- **Nuitka**: `pip install nuitka`, C compiler (gcc/clang)
+- **PyInstaller**: `pip install pyinstaller`
+- **Go**: Go toolchain 1.21+, `go.mod` in project root
 - Launcher binary must exist (build with `cargo build --release`)
 
 ## `seal keygen`

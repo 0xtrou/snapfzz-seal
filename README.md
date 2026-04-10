@@ -23,12 +23,12 @@ Snapfzz Seal implements defense-in-depth security to protect the master secret:
 
 ### 🔒 6-Layer Security Architecture
 
-1. **No Observable Patterns** - Random markers generated at compile time
+1. **No Observable Patterns** - Markers derived from build ID (deterministic)
 2. **Shamir Secret Sharing** - Split into 5 shares, requires 3 to reconstruct
-3. **Decoy Secrets** - 10 fake secret sets to confuse attackers
+3. **Decoy Secrets** - 10 decoy markers generated (implementation in progress)
 4. **Anti-Analysis** - Debugger and VM detection
-5. **Integrity Binding** - Decryption key depends on binary hash
-6. **White-Box Cryptography** - ~165KB of lookup tables with embedded key
+5. **Integrity Binding** - Decryption key depends on binary hash (Linux only)
+6. **White-Box Cryptography** - ~165KB lookup tables embedded (tables generated, runtime integration in progress)
 
 **Security Impact:**
 - Before: Master secret trivially extractable with basic tools
@@ -60,13 +60,13 @@ seal compile \
   --user-fingerprint $USER_FP \
   --sandbox-fingerprint auto \
   --output ./agent.sealed \
-  --launcher ./target/release/snapfzz-seal-launcher
+  --launcher ./target/release/seal-launcher
 ```
 
 ### 4. Sign
 
 ```bash
-seal sign --key ~/.snapfzz-seal/keys/key --binary ./agent.sealed
+seal sign --key ~/.snapfzz-seal/keys/builder_secret.key --binary ./agent.sealed
 ```
 
 ### 5. Launch
@@ -104,9 +104,9 @@ Snapfzz Seal raises attacker cost but is **not** a replacement for:
 
 ### Security Posture
 
-**Coverage:** 93.03% test coverage  
-**Security Layers:** 6 independent protection mechanisms  
-**Attacker Cost:** Expert-level cryptanalysis required
+**Coverage:** 90%+ test coverage  
+**Security Layers:** 4 fully implemented + 2 partially implemented  
+**Attacker Cost:** Significantly raised vs plaintext secrets
 
 See [Threat Model](https://0xtrou.github.io/snapfzz-seal/security/threat-model.html) for details.
 

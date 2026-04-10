@@ -58,14 +58,19 @@ Compile and seal an agent from source.
 **Notes**:
 - Compilation runs asynchronously
 - Request returns `202 Accepted` immediately
-- Fingerprint validation happens during async compilation
-- Invalid fingerprints cause job to transition to `failed` state
+- `project_dir` validation happens synchronously (returns `400` if invalid path)
+- Fingerprint format validation happens synchronously (returns `400` if invalid)
+- Backend tool availability checked during async compilation (causes `failed` state)
 - Use `GET /api/v1/jobs/\{job_id\}` to check progress
 
-**Validation errors** (cause job to fail, not immediate 400):
-- Invalid `user_fingerprint` or `sandbox_fingerprint` format
-- Backend tool (Nuitka/PyInstaller) not installed
-- Project directory doesn't exist or outside `compile_dir`
+**Synchronous validation errors** (immediate `400` response):
+- `project_dir` outside `compile_dir` or doesn't exist
+- Invalid `user_fingerprint` format (not 64 hex chars)
+- Invalid `sandbox_fingerprint` format (not `auto` or 64 hex chars)
+
+**Async failures** (job transitions to `failed` state):
+- Backend tool (Nuitka/PyInstaller/Go) not installed
+- Compilation errors during backend execution
 
 ---
 
@@ -108,16 +113,16 @@ Launch a compiled agent in a Docker sandbox.
 
 **Errors**:
 
-| Status | Error |
-|--------|-------|
-| 404 | `job not found` |
-| 400 | `job is not ready for dispatch` (not in `ready` state) |
-| 500 | Docker provisioning error |
+| Status | Condition | Response Body |
+|--------|-----------|---------------|
+| 404 | Job not found | `job not found` (plain text) |
+| 400 | Job not ready for dispatch | `job is not ready for dispatch` (plain text) |
 
 **Notes**:
 - Job must be in `ready` state (compile completed successfully)
-- Docker image will be pulled if not present
-- Execution runs asynchronously
+- Docker image will be pulled if not present (may trigger implicit pull by Docker daemon)
+- Execution runs asynchronously after `202` response
+- Provisioning/execution failures occur in background task and update job status to `failed`
 
 ---
 
