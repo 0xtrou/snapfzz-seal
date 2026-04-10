@@ -40,6 +40,7 @@ pub fn embed_decoy_secrets(binary: &[u8], real_index: usize) -> Result<Vec<u8>, 
 
     let mut modified = binary.to_vec();
 
+    #[allow(clippy::collapsible_if)]
     if let Some(pos) = modified
         .windows(POSITION_HINT_MARKER.len())
         .position(|window| window == POSITION_HINT_MARKER)

@@ -538,6 +538,7 @@ mod tests {
 
     async fn wait_for_status(state: &ServerState, job_id: &str, expected: JobState) {
         for _ in 0..240 {
+            #[allow(clippy::collapsible_if)]
             if let Some(job) = state.get_job(job_id).await {
                 if job.status == expected {
                     return;

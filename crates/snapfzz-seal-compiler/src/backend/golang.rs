@@ -62,8 +62,6 @@ pub fn compile_with_go(config: &GoConfig) -> Result<PathBuf, SealError> {
     let goarch = std::env::var("GOARCH").unwrap_or_else(|_| {
         if cfg!(target_arch = "aarch64") {
             "arm64".to_string()
-        } else if cfg!(target_arch = "x86_64") {
-            "amd64".to_string()
         } else {
             "amd64".to_string()
         }

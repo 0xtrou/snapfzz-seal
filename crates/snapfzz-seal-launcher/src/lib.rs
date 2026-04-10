@@ -275,6 +275,7 @@ fn extract_payload_from_assembled_binary(executable_bytes: &[u8]) -> Result<Vec<
         )
     })?;
 
+    #[allow(clippy::collapsible_if)]
     if let Some(first_offset) = first_marker_offset {
         if first_offset == last_marker_offset {
             tracing::warn!(
@@ -936,8 +937,10 @@ mod tests {
     #[test]
     fn load_payload_bytes_uses_explicit_path() {
         let path = unique_temp_path("payload");
-        let payload = b"ASL\x01direct-path".to_vec();
-        std::fs::write(&path, &payload).unwrap();
+        let payload = b"ASL\x01direct-path-content-here".to_vec();
+        let mut assembled = LAUNCHER_PAYLOAD_SENTINEL.to_vec();
+        assembled.extend_from_slice(&payload);
+        std::fs::write(&path, &assembled).unwrap();
 
         let loaded = load_payload_bytes(path.to_str()).unwrap();
         assert_eq!(loaded, payload);
@@ -1214,7 +1217,9 @@ mod tests {
     #[test]
     fn run_returns_invalid_payload_for_bad_header_before_antidebug() {
         let payload_path = unique_temp_path("bad-payload");
-        std::fs::write(&payload_path, b"not-a-valid-payload-header").unwrap();
+        let mut assembled = LAUNCHER_PAYLOAD_SENTINEL.to_vec();
+        assembled.extend_from_slice(b"not-a-valid-payload-header");
+        std::fs::write(&payload_path, &assembled).unwrap();
 
         let cli = Cli {
             payload: Some(payload_path.to_string_lossy().into_owned()),

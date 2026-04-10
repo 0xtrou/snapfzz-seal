@@ -204,6 +204,7 @@ impl SandboxBackend for DockerBackend {
 }
 
 fn find_docker_binary() -> Option<String> {
+    #[allow(clippy::collapsible_if)]
     if let Ok(explicit) = std::env::var("DOCKER_BIN") {
         if !explicit.trim().is_empty() {
             return Some(explicit);

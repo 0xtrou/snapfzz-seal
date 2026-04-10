@@ -194,7 +194,7 @@ impl WhiteBoxAES {
 
     /// Decrypt using white-box tables
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
-        if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
             return Err(SealError::DecryptionFailed(
                 "invalid ciphertext length for white-box decryption".to_string(),
             ));

@@ -144,6 +144,7 @@ impl FieldElement {
         result
     }
 
+    #[allow(clippy::collapsible_if)]
     fn random_nonzero(rng: &mut impl RngCore) -> Self {
         loop {
             let mut bytes = [0u8; 32];
