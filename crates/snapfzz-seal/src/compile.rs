@@ -28,12 +28,14 @@ pub enum CompileMode {
 pub enum CompileBackend {
     Nuitka,
     Pyinstaller,
+    Go,
 }
 
 pub fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let backend = match cli.backend {
         CompileBackend::Nuitka => snapfzz_seal_compiler::CliBackend::Nuitka,
         CompileBackend::Pyinstaller => snapfzz_seal_compiler::CliBackend::Pyinstaller,
+        CompileBackend::Go => snapfzz_seal_compiler::CliBackend::Go,
     };
     let mode = match cli.mode {
         CompileMode::Batch => snapfzz_seal_compiler::CliMode::Batch,
@@ -131,6 +133,13 @@ mod tests {
     #[test]
     fn run_errors_for_nonexistent_project_with_pyinstaller_backend() {
         let result = run(compile_cli(CompileBackend::Pyinstaller));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_errors_for_nonexistent_project_with_go_backend() {
+        let result = run(compile_cli(CompileBackend::Go));
 
         assert!(result.is_err());
     }
