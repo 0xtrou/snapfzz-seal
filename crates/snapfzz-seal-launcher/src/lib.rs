@@ -17,6 +17,8 @@ use std::io::Cursor;
 
 use clap::{Parser, ValueEnum};
 pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
+#[cfg(target_os = "linux")]
+use snapfzz_seal_core::integrity::{compute_binary_integrity_hash, find_integrity_regions};
 use snapfzz_seal_core::{
     derive::{derive_env_key, derive_session_key},
     error::SealError,
@@ -436,12 +438,8 @@ fn load_master_secret_from_env() -> Result<[u8; 32], SealError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snapfzz_seal_core::{
-        derive::{derive_env_key, derive_session_key},
-        payload::write_footer,
-        shamir::split_secret_with_rng,
-        types::{PayloadFooter, SHAMIR_THRESHOLD, SHAMIR_TOTAL_SHARES, get_secret_marker},
-    };
+    use snapfzz_seal_core::payload::write_footer;
+    use snapfzz_seal_core::shamir::split_secret_with_rng;
     use snapfzz_seal_fingerprint::{
         FingerprintSnapshot, RuntimeKind, SourceValue, Stability, canonicalize_ephemeral,
         canonicalize_stable,

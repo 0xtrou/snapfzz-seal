@@ -1,5 +1,6 @@
 use rand::RngCore;
 use std::collections::BTreeSet;
+use std::ops::{Add, Mul, Sub};
 
 const MODULUS: [u64; 4] = [
     0xFFFF_FFFE_FFFF_FC2F,
@@ -62,7 +63,7 @@ impl FieldElement {
         out
     }
 
-    pub fn add(self, rhs: Self) -> Self {
+    pub fn field_add(self, rhs: Self) -> Self {
         let (sum, carry) = add_words(self.limbs, rhs.limbs);
         let mut candidate = if carry {
             add_small(sum, TWO_256_MINUS_MODULUS)
@@ -77,7 +78,7 @@ impl FieldElement {
         Self { limbs: candidate }
     }
 
-    pub fn sub(self, rhs: Self) -> Self {
+    pub fn field_sub(self, rhs: Self) -> Self {
         let (diff, borrow) = sub_words(&self.limbs, &rhs.limbs);
         if borrow {
             let adjusted = sub_small(diff, TWO_256_MINUS_MODULUS);
@@ -87,13 +88,39 @@ impl FieldElement {
         }
     }
 
-    pub fn mul(self, rhs: Self) -> Self {
+    pub fn field_mul(self, rhs: Self) -> Self {
         let product = mul_words(&self.limbs, &rhs.limbs);
         Self {
             limbs: reduce_product(product),
         }
     }
+}
 
+impl Add for FieldElement {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::field_add(self, rhs)
+    }
+}
+
+impl Sub for FieldElement {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::field_sub(self, rhs)
+    }
+}
+
+impl Mul for FieldElement {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Self::field_mul(self, rhs)
+    }
+}
+
+impl FieldElement {
     pub fn invert(self) -> Result<Self, ShamirError> {
         if self == Self::zero() {
             return Err(ShamirError::InvalidShare("zero denominator".to_string()));
@@ -107,9 +134,9 @@ impl FieldElement {
 
         for limb in exponent.iter().rev() {
             for bit in (0..64).rev() {
-                result = result.mul(result);
+                result = result.field_mul(result);
                 if ((limb >> bit) & 1) == 1 {
-                    result = result.mul(self);
+                    result = result.field_mul(self);
                 }
             }
         }
@@ -248,12 +275,12 @@ pub fn reconstruct_secret(
                 continue;
             }
 
-            numerator = numerator.mul(x_j);
-            denominator = denominator.mul(x_j.sub(x_i));
+            numerator = numerator.field_mul(x_j);
+            denominator = denominator.field_mul(x_j.field_sub(x_i));
         }
 
-        let lagrange = numerator.mul(denominator.invert()?);
-        secret = secret.add(y_i.mul(lagrange));
+        let lagrange = numerator.field_mul(denominator.invert()?);
+        secret = secret.field_add(y_i.field_mul(lagrange));
     }
 
     Ok(secret.to_bytes())
@@ -262,7 +289,7 @@ pub fn reconstruct_secret(
 fn eval_polynomial(coefficients: &[FieldElement], x: FieldElement) -> FieldElement {
     let mut acc = FieldElement::zero();
     for coefficient in coefficients.iter().rev() {
-        acc = acc.mul(x).add(*coefficient);
+        acc = acc.field_mul(x).field_add(*coefficient);
     }
     acc
 }
@@ -575,8 +602,8 @@ mod tests {
     fn field_add_sub_round_trip() {
         let a = FieldElement::from_u64(123_456_789);
         let b = FieldElement::from_u64(987_654_321);
-        let c = a.add(b);
-        let back = c.sub(b);
+        let c = a.field_add(b);
+        let back = c.field_sub(b);
         assert_eq!(back, a);
     }
 
@@ -584,7 +611,7 @@ mod tests {
     fn field_mul_inverse_round_trip() {
         let value = FieldElement::from_u64(1337);
         let inv = value.invert().unwrap();
-        let product = value.mul(inv);
+        let product = value.field_mul(inv);
         assert_eq!(product, FieldElement::one());
     }
 

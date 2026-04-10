@@ -99,7 +99,7 @@ pub fn derive_key_with_integrity_from_binary(
     {
         let regions = find_integrity_regions(binary)?;
         let integrity_hash = compute_binary_integrity_hash(binary, &regions)?;
-        return Ok(bind_secret_to_hash(embedded_secret, &integrity_hash));
+        Ok(bind_secret_to_hash(embedded_secret, &integrity_hash))
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -117,7 +117,7 @@ pub fn derive_key_with_integrity(
     {
         let path = binary_path.unwrap_or("/proc/self/exe");
         let binary = std::fs::read(path)?;
-        return derive_key_with_integrity_from_binary(embedded_secret, &binary);
+        derive_key_with_integrity_from_binary(embedded_secret, &binary)
     }
 
     #[cfg(not(target_os = "linux"))]

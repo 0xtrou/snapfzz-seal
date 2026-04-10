@@ -111,7 +111,7 @@ impl WhiteBoxAES {
         for _col in 0..4 {
             let mut column_table = [[0u8; 256]; 4];
 
-            for row in 0..4 {
+            for (row, column_row) in column_table.iter_mut().enumerate() {
                 for input in 0u8..=255 {
                     // Inverse MixColumns coefficients for decryption
                     let coeff = match row {
@@ -124,7 +124,7 @@ impl WhiteBoxAES {
 
                     // GF(2^8) multiplication
                     let output = gf_mult(coeff, input);
-                    column_table[row][input as usize] = output;
+                    column_row[input as usize] = output;
                 }
             }
 
@@ -144,7 +144,7 @@ impl WhiteBoxAES {
         for _col in 0..4 {
             let mut column_table = [[0u8; 256]; 4];
 
-            for row in 0..4 {
+            for (row, column_row) in column_table.iter_mut().enumerate() {
                 for input in 0u8..=255 {
                     // Use standard MixColumns coefficients for decryption
                     let coeff = match row {
@@ -156,7 +156,7 @@ impl WhiteBoxAES {
                     };
 
                     let output = gf_mult(coeff, input);
-                    column_table[row][input as usize] = output;
+                    column_row[input as usize] = output;
                 }
             }
 
@@ -194,7 +194,7 @@ impl WhiteBoxAES {
 
     /// Decrypt using white-box tables
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
-        if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
             return Err(SealError::DecryptionFailed(
                 "invalid ciphertext length for white-box decryption".to_string(),
             ));
@@ -237,10 +237,8 @@ impl WhiteBoxAES {
         }
 
         // Apply mixing tables (except last round)
-        if round < 13 {
-            if round < self.tables.type_i.len() {
-                new_state = self.apply_mixing(&self.tables.type_i[round], &new_state);
-            }
+        if round < 13 && round < self.tables.type_i.len() {
+            new_state = self.apply_mixing(&self.tables.type_i[round], &new_state);
         }
 
         new_state

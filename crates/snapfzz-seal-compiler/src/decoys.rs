@@ -43,10 +43,9 @@ pub fn embed_decoy_secrets(binary: &[u8], real_index: usize) -> Result<Vec<u8>, 
     if let Some(pos) = modified
         .windows(POSITION_HINT_MARKER.len())
         .position(|window| window == POSITION_HINT_MARKER)
+        && pos + 32 <= modified.len()
     {
-        if pos + 32 <= modified.len() {
-            modified[pos..pos + 32].copy_from_slice(&hint);
-        }
+        modified[pos..pos + 32].copy_from_slice(&hint);
     }
 
     Ok(modified)
