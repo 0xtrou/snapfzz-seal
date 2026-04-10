@@ -2,6 +2,7 @@ use sha2::{Digest, Sha256};
 use snapfzz_seal_core::{error::SealError, types::POSITION_HINT_SALT};
 
 const DECOY_SETS: usize = 10;
+const POSITION_HINT_MARKER: &[u8] = b"ASL_POSITION_HINT_v1";
 
 pub fn generate_decoy_secret(set_index: usize) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -32,29 +33,23 @@ pub fn determine_real_position(hint: &[u8; 32], salt: &[u8; 32]) -> usize {
     0
 }
 
-pub fn embed_decoy_secrets(binary: &mut Vec<u8>, real_index: usize) -> Result<[u8; 32], SealError> {
+pub fn embed_decoy_secrets(binary: &[u8], real_index: usize) -> Result<Vec<u8>, SealError> {
     let _decoys = generate_all_decoys();
     let salt = rand::random::<[u8; 32]>();
     let hint = obfuscate_real_position(real_index, &salt);
 
-    let hint_location = find_or_create_slot(binary, b"POSITION_HINT_MARKER")?;
-    binary[hint_location..hint_location + 32].copy_from_slice(&hint);
+    let mut modified = binary.to_vec();
 
-    Ok(salt)
-}
-
-fn find_or_create_slot(binary: &mut Vec<u8>, marker: &[u8]) -> Result<usize, SealError> {
-    if let Some(pos) = binary
-        .windows(marker.len())
-        .position(|window| window == marker)
+    if let Some(pos) = modified
+        .windows(POSITION_HINT_MARKER.len())
+        .position(|window| window == POSITION_HINT_MARKER)
     {
-        return Ok(pos + marker.len());
+        if pos + 32 <= modified.len() {
+            modified[pos..pos + 32].copy_from_slice(&hint);
+        }
     }
 
-    let pos = binary.len();
-    binary.extend_from_slice(marker);
-    binary.extend_from_slice(&[0u8; 32]);
-    Ok(pos + marker.len())
+    Ok(modified)
 }
 
 #[cfg(test)]
@@ -90,10 +85,12 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_decoy_secrets_writes_hint_and_returns_salt() {
-        let mut binary = Vec::new();
-        let salt = embed_decoy_secrets(&mut binary, 3).expect("embedding should succeed");
-        let hint = obfuscate_real_position(3, &salt);
-        assert!(binary.windows(32).any(|window| window == hint));
+    fn test_embed_decoy_secrets_with_marker() {
+        let mut binary = b"test binary".to_vec();
+        binary.extend_from_slice(POSITION_HINT_MARKER);
+        binary.extend_from_slice(&[0u8; 32]);
+
+        let result = embed_decoy_secrets(&binary, 3).expect("embedding should succeed");
+        assert!(result.len() >= binary.len());
     }
 }

@@ -1,4 +1,6 @@
+use crate::decoys::embed_decoy_secrets;
 use crate::embed::{embed_master_secret, embed_tamper_hash};
+use crate::whitebox_embed::{embed_whitebox_tables, generate_whitebox_tables};
 use sha2::{Digest, Sha256};
 use snapfzz_seal_core::{
     derive::derive_env_key,
@@ -33,11 +35,16 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
 
     let launcher_with_secret = embed_master_secret(&launcher_bytes, &config.master_secret)?;
 
-    let mut tamper_hash = [0_u8; 32];
-    tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_secret));
-    let launcher_with_tamper = embed_tamper_hash(&launcher_with_secret, &tamper_hash)?;
+    let launcher_with_decoys = embed_decoy_secrets(&launcher_with_secret, 0)?;
 
-    let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)?;
+    let mut tamper_hash = [0_u8; 32];
+    tamper_hash.copy_from_slice(&Sha256::digest(&launcher_with_decoys));
+    let launcher_with_tamper = embed_tamper_hash(&launcher_with_decoys, &tamper_hash)?;
+
+    let whitebox_tables = generate_whitebox_tables(&config.master_secret);
+    let launcher_with_whitebox = embed_whitebox_tables(&launcher_with_tamper, &whitebox_tables)?;
+
+    let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_whitebox)?;
 
     let encrypted_payload =
         pack_payload_with_mode(Cursor::new(&agent_elf_bytes), &integrity_key, config.mode)?;
@@ -45,8 +52,8 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     let mut original_hash = [0_u8; 32];
     original_hash.copy_from_slice(&Sha256::digest(&agent_elf_bytes));
 
-    let regions = find_integrity_regions(&launcher_with_tamper)?;
-    let launcher_hash = compute_binary_integrity_hash(&launcher_with_tamper, &regions)?;
+    let regions = find_integrity_regions(&launcher_with_whitebox)?;
+    let launcher_hash = compute_binary_integrity_hash(&launcher_with_whitebox, &regions)?;
 
     let footer = PayloadFooter {
         original_hash,
@@ -55,12 +62,12 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     let footer_bytes = write_footer(&footer);
 
     let mut assembled = Vec::with_capacity(
-        launcher_with_tamper.len()
+        launcher_with_whitebox.len()
             + LAUNCHER_PAYLOAD_SENTINEL.len()
             + encrypted_payload.len()
             + footer_bytes.len(),
     );
-    assembled.extend_from_slice(&launcher_with_tamper);
+    assembled.extend_from_slice(&launcher_with_whitebox);
     assembled.extend_from_slice(LAUNCHER_PAYLOAD_SENTINEL);
     assembled.extend_from_slice(&encrypted_payload);
     assembled.extend_from_slice(&footer_bytes);

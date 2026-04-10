@@ -50,7 +50,14 @@ pub fn verify_tamper(expected_hash: &[u8]) -> Result<(), SealError> {
         ));
     }
 
+    let mut expected = [0_u8; 32];
+    expected.copy_from_slice(expected_hash);
+
     let current_hash = compute_binary_hash()?;
+    verify_hash_match(current_hash, &expected)
+}
+
+fn verify_hash_match(current_hash: [u8; 32], expected_hash: &[u8; 32]) -> Result<(), SealError> {
     if current_hash.ct_eq(expected_hash).into() {
         Ok(())
     } else {
@@ -150,6 +157,23 @@ mod tests {
     fn verify_tamper_accepts_current_binary_hash_on_linux() {
         let hash = compute_binary_hash().expect("hash should be computed on linux");
         verify_tamper(&hash).expect("current binary hash should verify");
+    }
+
+    #[test]
+    fn verify_hash_match_accepts_equal_hashes() {
+        let current = [0x44; 32];
+        let expected = [0x44; 32];
+
+        verify_hash_match(current, &expected).expect("matching hashes should verify");
+    }
+
+    #[test]
+    fn verify_hash_match_rejects_mismatched_hashes() {
+        let current = [0x44; 32];
+        let expected = [0x44; 32].map(|byte| byte ^ 0x01);
+
+        let err = verify_hash_match(current, &expected).expect_err("mismatch should be detected");
+        assert!(matches!(err, SealError::TamperDetected));
     }
 
     #[cfg(not(target_os = "linux"))]
