@@ -86,3 +86,117 @@ pub struct ExecutionResult {
     pub stdout: String,
     pub stderr: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::payload::{read_footer, write_footer};
+
+    #[test]
+    fn secret_markers_are_unique_and_32_bytes() {
+        let markers = [
+            get_secret_marker(0),
+            get_secret_marker(1),
+            get_secret_marker(2),
+            get_secret_marker(3),
+            get_secret_marker(4),
+        ];
+
+        for marker in markers {
+            assert_eq!(marker.len(), 32);
+            assert!(marker.iter().any(|byte| *byte != 0));
+        }
+
+        for left in 0..markers.len() {
+            for right in left + 1..markers.len() {
+                assert_ne!(
+                    markers[left], markers[right],
+                    "secret markers should be distinct"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid marker index")]
+    fn secret_marker_panics_for_out_of_range_index() {
+        let _ = get_secret_marker(SHAMIR_TOTAL_SHARES);
+    }
+
+    #[test]
+    fn decoy_markers_cover_all_sets_and_are_distinct_from_secret_markers() {
+        let secret_markers = [
+            get_secret_marker(0),
+            get_secret_marker(1),
+            get_secret_marker(2),
+            get_secret_marker(3),
+            get_secret_marker(4),
+        ];
+
+        let first = get_decoy_marker(0, 0);
+        let last = get_decoy_marker(9, 4);
+
+        assert_eq!(first.len(), 32);
+        assert_eq!(last.len(), 32);
+        assert_ne!(first, last);
+        assert!(secret_markers.iter().all(|marker| *marker != first));
+        assert!(secret_markers.iter().all(|marker| *marker != last));
+    }
+
+    #[test]
+    fn launcher_markers_alias_expected_secret_and_generated_markers() {
+        assert_eq!(LAUNCHER_SECRET_MARKER, get_secret_marker(0));
+        assert_eq!(LAUNCHER_TAMPER_MARKER, &TAMPER_MARKER);
+        assert_eq!(LAUNCHER_PAYLOAD_SENTINEL, &PAYLOAD_SENTINEL);
+    }
+
+    #[test]
+    fn payload_footer_round_trips_through_binary_serialization() {
+        let footer = PayloadFooter {
+            original_hash: [0x11; 32],
+            launcher_hash: [0x22; 32],
+        };
+
+        let serialized = write_footer(&footer);
+        let parsed = read_footer(&serialized).expect("footer should deserialize");
+
+        assert_eq!(parsed, footer);
+    }
+
+    #[test]
+    fn payload_footer_preserves_hash_order_in_binary_serialization() {
+        let footer = PayloadFooter {
+            original_hash: [0xAA; 32],
+            launcher_hash: [0xBB; 32],
+        };
+
+        let serialized = write_footer(&footer);
+
+        assert_eq!(&serialized[..32], &[0xAA; 32]);
+        assert_eq!(&serialized[32..], &[0xBB; 32]);
+    }
+
+    #[test]
+    fn agent_mode_default_and_type_conversions_cover_valid_and_invalid_values() {
+        assert_eq!(AgentMode::default(), AgentMode::Batch);
+        assert_eq!(AgentMode::Batch.as_u8(), 0);
+        assert_eq!(AgentMode::Interactive.as_u8(), 1);
+        assert_eq!(AgentMode::from_u8(0), Some(AgentMode::Batch));
+        assert_eq!(AgentMode::from_u8(1), Some(AgentMode::Interactive));
+        assert_eq!(AgentMode::from_u8(2), None);
+        assert_eq!(AgentMode::from_u8(u8::MAX), None);
+    }
+
+    #[test]
+    fn constants_match_expected_wire_values() {
+        assert_eq!(MAGIC_BYTES, *b"ASL\x01");
+        assert_eq!(VERSION_V1, 0x0001);
+        assert_eq!(ENC_ALG_AES256_GCM, 0x0001);
+        assert_eq!(FMT_STREAM, 0x0001);
+        assert_eq!(CHUNK_SIZE, 65_536);
+        assert_eq!(KDF_INFO_ENV, b"snapfzz-seal/env/v1");
+        assert_eq!(KDF_INFO_SESSION, b"snapfzz-seal/session/v1");
+        assert_eq!(SHAMIR_TOTAL_SHARES, 5);
+        assert_eq!(SHAMIR_THRESHOLD, 3);
+    }
+}

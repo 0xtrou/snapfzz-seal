@@ -30,7 +30,7 @@ All agent payloads are encrypted using AES-256-GCM (Galois/Counter Mode), provid
 
 The decryption key is derived using HKDF (HMAC-based Key Derivation Function) with the following inputs:
 
-1. **Master secret** — 256-bit random value generated at compile time
+1. **Master secret** — Protected by 6-layer defense-in-depth security
 2. **Stable hash** — Hash of stable environment signals
 3. **User fingerprint** — Arbitrary identifier provided by operator
 
@@ -47,12 +47,7 @@ Key = HKDF-Expand(PRK, info="snapfzz-seal/env/v1", L=32)
 **Security properties**:
 - Key is cryptographically bound to environment and user fingerprint
 - Different fingerprint combinations produce independent keys
-
-:::caution
-
-The **master secret is embedded in plaintext** in the final binary. This is necessary for self-contained execution but means an attacker with binary access can extract it. See [Threat Model](../security/threat-model.md) for implications.
-
-:::
+- Master secret protected by white-box cryptography (not stored in plaintext)
 
 ### Digital Signatures
 
@@ -369,9 +364,9 @@ There is **no "no-op stub"** for Windows/macOS that returns success. Execution o
 
 1. **Hardware attestation** — No TPM/SGX integration
 2. **Trusted signer identity** — Signatures verify integrity, not identity (attacker can re-sign)
-3. **Perfect security** — Master secret is embedded in binary; privileged adversaries can extract it
+3. **Perfect security** — Expert-level reverse engineering can extract master secret
 4. **Network security** — Agent network traffic is not encrypted or authenticated
-5. **Key distribution** — Secure distribution of signing keys and master secrets is operator's responsibility
+5. **Key distribution** — Secure distribution of signing keys is operator's responsibility
 6. **Runtime integrity** — Once executing, the agent process is not monitored for tampering
 7. **Cross-platform execution** — Only Linux supports sealed agent execution
 

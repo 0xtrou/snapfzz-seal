@@ -136,8 +136,8 @@ Snapfzz Seal implements 6 security layers to protect master secrets:
 ### Security Guarantees
 
 **Before (Pre-v0.2):**
-- Master secret stored in plaintext
-- Trivially extractable with basic tools
+- Master secret trivially extractable
+- Basic tools sufficient for extraction
 
 **After (v0.2+):**
 - Master secret protected by 6 layers

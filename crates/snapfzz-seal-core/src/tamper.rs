@@ -62,6 +62,36 @@ pub fn verify_tamper(expected_hash: &[u8]) -> Result<(), SealError> {
 mod tests {
     use super::*;
 
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn compute_hash_of_bytes_matches_sha256_for_various_sizes() {
+        for len in [0_usize, 1, 31, 32, 33, 256, 4096, 65_537] {
+            let input: Vec<u8> = (0..len).map(|idx| ((idx * 17 + 3) % 251) as u8).collect();
+            let computed = compute_hash_of_bytes(&input);
+
+            let expected = Sha256::digest(&input);
+            let mut expected_arr = [0_u8; 32];
+            expected_arr.copy_from_slice(&expected);
+
+            assert_eq!(computed, expected_arr, "hash mismatch for input len={len}");
+        }
+    }
+
+    #[test]
+    fn compute_hash_of_bytes_is_deterministic_and_input_sensitive() {
+        let a = vec![0xAB; 1024];
+        let mut b = a.clone();
+        b[17] ^= 0x01;
+
+        let hash_a_first = compute_hash_of_bytes(&a);
+        let hash_a_second = compute_hash_of_bytes(&a);
+        let hash_b = compute_hash_of_bytes(&b);
+
+        assert_eq!(hash_a_first, hash_a_second);
+        assert_ne!(hash_a_first, hash_b);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn binary_hash_is_32_bytes() {
@@ -92,10 +122,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn verify_tamper_rejects_too_long_hash_length() {
+        let err = verify_tamper(&[0_u8; 33]).expect_err("33-byte hash must be rejected");
+        assert!(matches!(err, SealError::InvalidInput(_)));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn verify_tamper_detects_mismatch_on_linux() {
         let err = verify_tamper(&[0_u8; 32]).expect_err("wrong hash should be detected");
+        assert!(matches!(err, SealError::TamperDetected));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_tamper_detects_near_match_mismatch_on_linux() {
+        let mut hash = compute_binary_hash().expect("hash should be computed on linux");
+        hash[0] ^= 0x01;
+
+        let err = verify_tamper(&hash).expect_err("bit-flipped hash should be rejected");
         assert!(matches!(err, SealError::TamperDetected));
     }
 
