@@ -111,35 +111,34 @@ If any stage fails, execution is aborted with an appropriate error code.
 
 ### Anti-Debugging Protections
 
-**Specification**: Limited ptrace restrictions (Linux only)
+**Specification**: Multi-layer anti-debugging on Linux
 
-The launcher implements basic anti-debugging on Linux:
+The launcher implements anti-debugging measures:
 
 - ✅ **PR_SET_DUMPABLE=0** — Prevents ptrace attachment
 - ✅ **ptrace(TRACEME)** — Claims tracer slot
-
-**NOT IMPLEMENTED**:
-- ❌ Timing checks for debugging detection
-- ❌ Tracer detection via `/proc/self/status`
-- ❌ Parent process verification
+- ✅ **TracerPid detection** — Checks `/proc/self/status`
+- ✅ **Timing checks** — Detects debugging delays
+- ✅ **Breakpoint scanning** — Detects software breakpoints
 
 **Security properties**:
-- Raises the cost of casual debugging attempts
+- Raises the cost of debugging attempts
+- Multiple detection layers complicate bypass
 - May be bypassed by sophisticated adversaries with elevated privileges
 
 ### System Call Filtering
 
 **Specification**: seccomp-bpf with allowlist (Linux only)
 
-The launcher attempts to install a seccomp filter that restricts allowed system calls. The default allowlist includes:
+The launcher installs a seccomp filter that restricts allowed system calls using default-deny semantics. All syscalls not in the allowlist are blocked with `EPERM`. The default allowlist includes:
 
 - Memory operations: `mmap`, `munmap`, `mprotect`, `brk`
 - File operations: `read`, `write`, `open`, `close`, `stat`, `lstat`, `fstat`
 - Process operations: `exit`, `exit_group`, `arch_prctl`
-- Network operations: `socket`, `connect`, `bind`, `listen`, `accept`, `send`, `recv`
+- Network operations: `socket`, `connect`, `bind`, `listen`, `accept4`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`
 - Process creation: `clone`, `clone3` (allowed)
 
-**NOT blocked**: `fork`, `vfork`
+**Blocked**: `fork`, `vfork` (not in allowlist, blocked by default-deny policy)
 
 :::caution[Best-Effort Enforcement]
 

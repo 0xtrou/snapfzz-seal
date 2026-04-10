@@ -24,7 +24,7 @@ Snapfzz Seal implements 6 independent security layers to protect master secrets:
 ### Layer 2: Shamir Secret Sharing
 - Master secret split into 5 shares
 - Requires minimum 3 shares to reconstruct
-- Pure Rust GF(2^256) field arithmetic
+- Prime field arithmetic (secp256k1 modulus)
 
 ### Layer 3: Decoy Secrets
 - 10 fake secret sets
@@ -42,10 +42,10 @@ Snapfzz Seal implements 6 independent security layers to protect master secrets:
 - Exclusion of secret regions from hash
 
 ### Layer 6: White-Box Cryptography
-- Key spread across thousands of lookup tables
-- ~500KB-2MB of tables per master key
+- Key spread across ~165KB of lookup tables
+- T-boxes + Type I/II mixing tables
 - No single table reveals the key
-- Requires weeks-months of expert cryptanalysis
+- Requires expert-level cryptanalysis
 
 **Security Impact:**
 - Before: Master secret trivially extractable

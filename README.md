@@ -28,7 +28,7 @@ Snapfzz Seal implements defense-in-depth security to protect the master secret:
 3. **Decoy Secrets** - 10 fake secret sets to confuse attackers
 4. **Anti-Analysis** - Debugger and VM detection
 5. **Integrity Binding** - Decryption key depends on binary hash
-6. **White-Box Cryptography** - Key spread across thousands of lookup tables
+6. **White-Box Cryptography** - ~165KB of lookup tables with embedded key
 
 **Security Impact:**
 - Before: Master secret trivially extractable with basic tools
