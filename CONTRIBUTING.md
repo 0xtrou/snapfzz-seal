@@ -279,9 +279,10 @@ Snapfzz Seal is a security-critical project. When contributing:
 
 Changes to these areas require extra scrutiny:
 
-- Cryptographic operations (`crates/snapfzz-seal-core/src/encrypt.rs`)
-- Key derivation (`crates/snapfzz-seal-core/src/fingerprint.rs`)
-- Signature verification (`crates/snapfzz-seal-core/src/signature.rs`)
+- Cryptographic operations (`crates/snapfzz-seal-core/src/crypto.rs`)
+- Key derivation (`crates/snapfzz-seal-core/src/derive.rs`)
+- Signature verification (`crates/snapfzz-seal-core/src/signing.rs`)
+- Fingerprinting (`crates/snapfzz-seal-fingerprint/src/collect.rs`)
 - Seccomp filters (`crates/snapfzz-seal-launcher/src/seccomp.rs`)
 - Memory handling (any `unsafe` code)
 
@@ -289,12 +290,14 @@ Changes to these areas require extra scrutiny:
 
 **Do not open public issues for security vulnerabilities.**
 
-Instead, email security concerns to the maintainers privately. Include:
+Email security concerns to the maintainers privately. Include:
 
 - Description of the vulnerability
 - Steps to reproduce
 - Potential impact
 - Suggested fix (if available)
+
+**Note**: No dedicated security email address is currently configured. Contact maintainers through GitHub or other private channels.
 
 ### Security Best Practices
 

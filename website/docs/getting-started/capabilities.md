@@ -329,23 +329,29 @@ There is **no "no-op stub"** for Windows/macOS that returns success. Execution o
 
 ### Performance Overhead
 
-| Operation | Overhead |
-|-----------|----------|
-| Encryption (per MB) | ~5-10ms |
-| Decryption (per MB) | ~5-10ms |
+:::note
+
+The following values are estimates based on typical workloads. Actual performance depends on hardware, payload characteristics, and runtime conditions. Benchmark before relying on these numbers for capacity planning.
+
+:::
+
+| Operation | Estimated Overhead |
+|-----------|-------------------|
+| Encryption (per MB) | ~5-10ms (varies by CPU) |
+| Decryption (per MB) | ~5-10ms (varies by CPU) |
 | Signature verification | ~1ms |
 | Fingerprint collection | ~50-100ms |
 | memfd setup | ~1ms |
 
 ### Resource Requirements
 
-- **Minimum RAM**: 64MB for launcher
+- **Minimum RAM**: Sufficient for launcher + decrypted payload
 - **Disk space**: 2x payload size during compilation
 - **CPU**: x86_64 with SSE2 (AES-NI recommended for performance)
 
 ### Scalability Limits
 
-- **Maximum payload size**: 2GB (limited by memory and address space)
+- **Maximum payload size**: Limited by available memory
 - **Maximum concurrent executions**: Limited by host resources and Docker
 - **Key rotation**: Manual process, requires re-compilation
 
