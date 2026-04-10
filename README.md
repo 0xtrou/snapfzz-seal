@@ -104,7 +104,7 @@ Snapfzz Seal raises attacker cost but is **not** a replacement for:
 
 ### Security Posture
 
-**Coverage:** 92.38% test coverage  
+**Coverage:** 93.03% test coverage  
 **Security Layers:** 6 independent protection mechanisms  
 **Attacker Cost:** Expert-level cryptanalysis required
 

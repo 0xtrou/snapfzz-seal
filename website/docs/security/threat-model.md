@@ -193,10 +193,9 @@ seal verify --binary ./artifact.sealed --pubkey trusted.key
 - Memory and process introspection by privileged local actors
 
 **Anti-debugging reality**:
-- Only basic ptrace protections implemented
-- No timing-based debugger detection
-- No tracer process detection
-- Sophisticated adversaries can bypass easily
+- Multi-layer protections implemented (ptrace, TracerPid, timing checks, breakpoint scanning)
+- Sophisticated adversaries with elevated privileges can bypass
+- Protections raise attacker cost but do not guarantee prevention
 
 **Seccomp reality**:
 - Applied on best-effort basis
@@ -323,3 +322,25 @@ The following are **outside** Snapfzz Seal's security boundary:
 | Memory extraction | Memory-only execution | Root can dump memory |
 
 **Bottom line**: Snapfzz Seal raises the cost of attacks but does not provide perfect security. Use defense-in-depth with additional controls appropriate to your threat model.
+
+## References
+
+### Cryptographic Standards
+
+- **AES-256-GCM**: Dworkin, M. (2007). "Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC". NIST Special Publication 800-38D. [doi:10.6028/NIST.SP.800-38D](https://doi.org/10.6028/NIST.SP.800-38D)
+
+- **HKDF**: Krawczyk, H. (2010). "Cryptographic Extraction and Key Derivation: The HKDF Scheme". RFC 5869. [doi:10.17487/RFC5869](https://doi.org/10.17487/RFC5869)
+
+- **Ed25519**: Bernstein, D. et al. (2012). "High-speed high-security signatures". Journal of Cryptographic Engineering 4(2). [doi:10.1007/s13389-012-0007-1](https://doi.org/10.1007/s13389-012-0007-1)
+
+### Secret Sharing
+
+- **Shamir Secret Sharing**: Shamir, A. (1979). "How to Share a Secret". Communications of the ACM 22(11):612-613. [doi:10.1145/359168.359176](https://doi.org/10.1145/359168.359176)
+
+### White-Box Cryptography
+
+- **White-Box AES**: Chow, S. et al. (2002). "White-Box Cryptography and an AES Implementation". Selected Areas in Cryptography (SAC 2002), LNCS 2595. [doi:10.1007/3-540-36492-7_17](https://doi.org/10.1007/3-540-36492-7_17)
+
+### Security Principles
+
+- **Defense-in-Depth**: Saltzer, J. & Schroeder, M. (1975). "The Protection of Information in Computer Systems". Proceedings of the IEEE 63(9). [doi:10.1109/PROC.1975.9939](https://doi.org/10.1109/PROC.1975.9939)

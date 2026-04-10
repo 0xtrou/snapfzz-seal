@@ -388,3 +388,13 @@ Snapfzz Seal is NOT effective against:
 - Runtime introspection by root users
 
 For comprehensive threat analysis, see [Threat Model](../security/threat-model.md).
+
+## References
+
+### Cryptographic Standards
+
+- **AES-256-GCM**: Dworkin, M. (2007). NIST SP 800-38D.
+- **HKDF-SHA256**: Krawczyk, H. (2010). RFC 5869.
+- **Ed25519**: Bernstein, D. et al. (2012). Journal of Cryptographic Engineering 4(2).
+- **Shamir Secret Sharing**: Shamir, A. (1979). CACM 22(11):612-613.
+- **White-Box AES**: Chow, S. et al. (2002). SAC 2002, LNCS 2595.

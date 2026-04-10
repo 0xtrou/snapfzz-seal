@@ -56,17 +56,18 @@ The launcher binary is read and patched with marker-based embed operations:
 - **Layer 2**: Shamir secret share embedding (5 shares, 3 threshold)
 - **Layer 3**: Decoy secret set embedding (10 fake sets)
 - **Layer 5**: Launcher tamper hash replacement
-- **Layer 6**: White-box table embedding (~500KB-2MB)
+- **Layer 6**: White-box table embedding (~165KB)
 
 The assembled binary is then written as:
 
 ```text
-[launcher_with_embeds]
+[launcher_with_embeds (including white-box tables)]
 [LAUNCHER_PAYLOAD_SENTINEL]
 [encrypted_payload]
 [payload_footer]
-[white-box_tables]
 ```
+
+White-box tables are embedded into the launcher binary before the payload sentinel, not appended after the footer.
 
 ### 5. Signing stage
 
@@ -138,7 +139,7 @@ Snapfzz Seal implements defense-in-depth security with 6 protection layers:
 **Layer 2: Shamir Secret Sharing**
 - Master secret split into 5 shares
 - Requires minimum 3 shares to reconstruct
-- GF(2^256) field arithmetic
+- Prime field arithmetic (secp256k1 modulus)
 
 **Layer 3: Decoy Secrets**
 - 10 fake secret sets embedded
@@ -156,7 +157,7 @@ Snapfzz Seal implements defense-in-depth security with 6 protection layers:
 - Detects binary modifications
 
 **Layer 6: White-Box Cryptography**
-- Key spread across ~500KB-2MB of tables
+- Key spread across ~165KB of lookup tables
 - T-boxes + Type I/II mixing tables
 - No single table reveals the key
 
@@ -173,3 +174,19 @@ Snapfzz Seal implements defense-in-depth security with 6 protection layers:
 - Complete resistance to runtime memory inspection is not provided.
 - Platform behavior differs, especially outside Linux.
 - Security properties depend on trustworthy host kernel and userspace boundary.
+
+## References
+
+### Cryptographic Foundations
+
+- **AES-GCM**: Dworkin, M. (2007). NIST SP 800-38D. Galois/Counter Mode specification.
+
+- **HKDF**: Krawczyk, H. (2010). RFC 5869. HMAC-based Extract-and-Expand Key Derivation Function.
+
+- **Shamir Secret Sharing**: Shamir, A. (1979). "How to Share a Secret". CACM 22(11):612-613.
+
+- **White-Box Cryptography**: Chow, S. et al. (2002). "White-Box Cryptography and an AES Implementation". SAC 2002, LNCS 2595.
+
+### Security Engineering
+
+- **Defense-in-Depth**: Saltzer & Schroeder (1975). "The Protection of Information in Computer Systems". Proc. IEEE 63(9).
