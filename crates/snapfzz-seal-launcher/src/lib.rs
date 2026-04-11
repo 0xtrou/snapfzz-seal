@@ -42,6 +42,8 @@ use snapfzz_seal_core::{
 use snapfzz_seal_fingerprint::{
     FingerprintCollector, FingerprintSnapshot, canonicalize_ephemeral, canonicalize_stable,
 };
+#[cfg(target_os = "linux")]
+use subtle::ConstantTimeEq;
 pub use temp_exec::InteractiveHandle as TempInteractiveHandle;
 use tracing_subscriber::EnvFilter;
 use zeroize::{Zeroize, Zeroizing};
@@ -535,7 +537,7 @@ fn verify_launcher_integrity(
         let regions = find_integrity_regions(full_binary)?;
         let launcher_hash = compute_binary_integrity_hash(full_binary, &regions)?;
 
-        if launcher_hash == *expected_hash {
+        if launcher_hash.ct_eq(expected_hash).into() {
             tracing::info!("launcher integrity verified");
             Ok(())
         } else {
