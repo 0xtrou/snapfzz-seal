@@ -3,6 +3,7 @@
 mod anti_analysis;
 #[allow(dead_code)]
 mod anti_debug;
+pub mod audit;
 mod cleanup;
 mod markers;
 
@@ -24,6 +25,7 @@ use std::io::Cursor;
 use crate::temp_exec::TempFileExecutor;
 use clap::{Parser, ValueEnum};
 pub use memfd_exec::{ExecConfig, InteractiveHandle, KernelMemfdOps, MemfdExecutor};
+use sha2::Digest as _;
 #[cfg(target_os = "linux")]
 use snapfzz_seal_core::integrity::{compute_binary_integrity_hash, find_integrity_regions};
 use snapfzz_seal_core::{
@@ -70,14 +72,24 @@ pub struct Cli {
     pub verbose: bool,
 }
 
-fn verify_signature(raw_binary: &[u8]) -> Result<(), SealError> {
+fn verify_signature(raw_binary: &[u8], audit: &audit::AuditLogger) -> Result<(), SealError> {
+    let payload_hash = hex::encode(sha2::Digest::finalize(sha2::Sha256::new_with_prefix(
+        raw_binary,
+    )));
+
     if raw_binary.len() < SIG_BLOCK_SIZE {
         tracing::error!("binary too short for signature verification");
+        audit.log(audit::AuditEvent::SignatureUnsigned {
+            payload_hash: payload_hash.clone(),
+        });
         return Err(SealError::MissingSignature);
     }
     let sig_start = raw_binary.len() - SIG_BLOCK_SIZE;
     if &raw_binary[sig_start..sig_start + 4] != SIG_MAGIC {
         tracing::error!("no signature block found; unsigned payload rejected");
+        audit.log(audit::AuditEvent::SignatureUnsigned {
+            payload_hash: payload_hash.clone(),
+        });
         return Err(SealError::MissingSignature);
     }
 
@@ -86,21 +98,36 @@ fn verify_signature(raw_binary: &[u8]) -> Result<(), SealError> {
     let mut pubkey = [0u8; 32];
     pubkey.copy_from_slice(&raw_binary[sig_start + 68..sig_start + 100]);
     let data = &raw_binary[..sig_start];
+    let pubkey_fingerprint = hex::encode(&pubkey[..16]);
 
     match signing::verify(&pubkey, data, &signature)? {
         true => {
             tracing::info!(
-                pubkey_fingerprint = %hex::encode(&pubkey[..16]),
+                pubkey_fingerprint = %pubkey_fingerprint,
                 "signature verified"
             );
+            audit.log(audit::AuditEvent::SignatureVerified {
+                payload_hash,
+                pubkey_fingerprint,
+            });
             Ok(())
         }
-        false => Err(SealError::InvalidSignature),
+        false => {
+            audit.log(audit::AuditEvent::SignatureInvalid {
+                payload_hash,
+                reason: "ed25519 signature verification failed".to_string(),
+            });
+            Err(SealError::InvalidSignature)
+        }
     }
 }
 
 pub fn run(cli: Cli) -> Result<(), SealError> {
     let _ = snapfzz_launcher_markers_ptr();
+
+    // Initialise the audit logger once at the top of run(); all security
+    // decision points below receive a shared reference to it.
+    let audit = audit::AuditLogger::from_env();
 
     let raw_binary = load_raw_binary(cli.payload.as_deref())?;
 
@@ -114,15 +141,18 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     let launcher_bytes_for_integrity = raw_for_integrity;
 
     validate_payload_header(&payload_bytes)?;
-    verify_signature(&raw_binary)?;
+    verify_signature(&raw_binary, &audit)?;
     let footer = extract_footer(&payload_bytes).map_err(|_| {
         SealError::InvalidPayload("missing or corrupted payload footer".to_string())
     })?;
 
-    verify_launcher_integrity(&footer.launcher_hash, raw_for_integrity)?;
+    verify_launcher_integrity(&footer.launcher_hash, raw_for_integrity, &audit)?;
 
     if anti_analysis::is_being_analyzed() {
         tracing::error!("analysis detected, aborting launcher execution");
+        audit.log(audit::AuditEvent::AnalysisDetected {
+            check: "anti_analysis".to_string(),
+        });
         return Err(SealError::InvalidInput(
             "analysis environment detected, refusing to continue".to_string(),
         ));
@@ -143,9 +173,19 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
             .map_err(|err| SealError::InvalidInput(err.to_string()))?,
     };
 
-    let _stable_hash = canonicalize_stable(&snapshot);
+    let stable_hash = canonicalize_stable(&snapshot);
 
     let user_fingerprint = decode_user_fingerprint(cli.user_fingerprint)?;
+
+    // Record fingerprint comparison before attempting decryption so even a
+    // mismatch-triggered exit produces an audit record.
+    let sandbox_fp = hex::encode(stable_hash);
+    let user_fp = hex::encode(user_fingerprint);
+    audit.log(audit::AuditEvent::FingerprintMatched {
+        sandbox_fp: sandbox_fp.clone(),
+        user_fp: user_fp.clone(),
+    });
+
     let mut master_secret = load_master_secret(raw_for_integrity)?;
 
     let mut decryption_key = derive_decryption_key(
@@ -165,16 +205,31 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     }
     let encrypted_payload = &payload_bytes[..payload_bytes.len() - FOOTER_SIZE];
 
+    // Compute payload hash for launch events (hash of encrypted payload so no
+    // plaintext ever appears in the audit log).
+    let payload_hash = hex::encode(sha2::Digest::finalize(sha2::Sha256::new_with_prefix(
+        encrypted_payload,
+    )));
+
     let decrypted = Zeroizing::new(
         match unpack_payload(Cursor::new(encrypted_payload), &decryption_key) {
             Ok((bytes, _header)) => bytes,
             Err(SealError::DecryptionFailed(_)) => {
+                audit.log(audit::AuditEvent::FingerprintMismatch {
+                    expected: user_fp,
+                    got: sandbox_fp,
+                });
                 eprintln!(
                     "ERROR: fingerprint mismatch — sandbox environment has changed, re-provisioning required"
                 );
                 std::process::exit(1);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                audit.log(audit::AuditEvent::LaunchFailed {
+                    reason: format!("payload decryption error: {err}"),
+                });
+                return Err(err);
+            }
         },
     );
 
@@ -196,14 +251,21 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     };
 
     let backend_type = footer.backend_type;
-    let result = match backend_type {
+    let backend_str = format!("{backend_type:?}").to_ascii_lowercase();
+
+    audit.log(audit::AuditEvent::LaunchStarted {
+        payload_hash: payload_hash.clone(),
+        backend: backend_str.clone(),
+    });
+
+    let exec_result = match backend_type {
         BackendType::Go => {
             let executor = MemfdExecutor::new(KernelMemfdOps);
-            executor.execute(decrypted.as_slice(), &config)?
+            executor.execute(decrypted.as_slice(), &config)
         }
         BackendType::PyInstaller | BackendType::Nuitka => {
             let executor = TempFileExecutor::new();
-            executor.execute(decrypted.as_slice(), &config)?
+            executor.execute(decrypted.as_slice(), &config)
         }
         BackendType::Unknown => {
             let executor = MemfdExecutor::new(KernelMemfdOps);
@@ -212,9 +274,28 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
                 .or_else(|_| {
                     tracing::warn!("memfd exec failed for unknown backend, using temp-file");
                     TempFileExecutor::new().execute(decrypted.as_slice(), &config)
-                })?
+                })
         }
     };
+
+    match exec_result {
+        Ok(ref result) => {
+            // ExecResult serialises to JSON; pull out exit_code if present.
+            let exit_code = serde_json::to_value(result)
+                .ok()
+                .and_then(|v| v.get("exit_code").and_then(|c| c.as_i64()))
+                .map(|c| c as i32)
+                .unwrap_or(0);
+            audit.log(audit::AuditEvent::LaunchCompleted { exit_code });
+        }
+        Err(ref err) => {
+            audit.log(audit::AuditEvent::LaunchFailed {
+                reason: format!("execution failed: {err}"),
+            });
+        }
+    }
+
+    let result = exec_result?;
     let json = serde_json::to_string(&result).map_err(|err| {
         SealError::InvalidInput(format!("failed to serialize execution result: {err}"))
     })?;
@@ -530,6 +611,7 @@ fn extract_embedded_master_secret(payload_bytes: &[u8]) -> Option<[u8; 32]> {
 fn verify_launcher_integrity(
     expected_hash: &[u8; 32],
     full_binary: &[u8],
+    audit: &audit::AuditLogger,
 ) -> Result<(), SealError> {
     #[cfg(target_os = "linux")]
     {
@@ -538,6 +620,9 @@ fn verify_launcher_integrity(
 
         if launcher_hash.ct_eq(expected_hash).into() {
             tracing::info!("launcher integrity verified");
+            audit.log(audit::AuditEvent::IntegrityVerified {
+                launcher_hash: hex::encode(launcher_hash),
+            });
             Ok(())
         } else {
             tracing::error!(
@@ -545,6 +630,13 @@ fn verify_launcher_integrity(
                 actual = %hex::encode(launcher_hash),
                 "launcher integrity check failed"
             );
+            audit.log(audit::AuditEvent::IntegrityFailed {
+                reason: format!(
+                    "hash mismatch: expected={}, got={}",
+                    hex::encode(expected_hash),
+                    hex::encode(launcher_hash)
+                ),
+            });
             Err(SealError::TamperDetected)
         }
     }
@@ -554,6 +646,9 @@ fn verify_launcher_integrity(
         let _ = expected_hash;
         let _ = full_binary;
         tracing::warn!("launcher integrity verification is skipped on non-Linux platforms");
+        audit.log(audit::AuditEvent::IntegrityVerified {
+            launcher_hash: "skipped-non-linux".to_string(),
+        });
         Ok(())
     }
 }
@@ -930,7 +1025,8 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn verify_launcher_integrity_skips_on_non_linux() {
-        verify_launcher_integrity(&[0xAB; 32], &[0xAA; 64])
+        let audit = audit::AuditLogger::from_env();
+        verify_launcher_integrity(&[0xAB; 32], &[0xAA; 64], &audit)
             .expect("non-linux should skip integrity check");
     }
 
@@ -938,15 +1034,17 @@ mod tests {
     #[test]
     fn verify_launcher_integrity_detects_mismatch_on_linux() {
         let launcher = launcher_with_secret_slots(96, 32);
+        let audit = audit::AuditLogger::from_env();
 
         let regions = find_integrity_regions(&launcher).expect("regions");
         let expected_hash = compute_binary_integrity_hash(&launcher, &regions).expect("hash");
 
-        let err =
-            verify_launcher_integrity(&[0xCC; 32], &launcher).expect_err("wrong hash must fail");
+        let err = verify_launcher_integrity(&[0xCC; 32], &launcher, &audit)
+            .expect_err("wrong hash must fail");
         assert!(matches!(err, SealError::TamperDetected));
 
-        verify_launcher_integrity(&expected_hash, &launcher).expect("correct hash should pass");
+        verify_launcher_integrity(&expected_hash, &launcher, &audit)
+            .expect("correct hash should pass");
     }
 
     #[test]
@@ -1415,15 +1513,17 @@ mod tests {
 
     #[test]
     fn verify_signature_rejects_payload_shorter_than_sig_block() {
+        let audit = audit::AuditLogger::from_env();
         let short = vec![0xAA; 50];
-        let err = verify_signature(&short).expect_err("short payload must fail");
+        let err = verify_signature(&short, &audit).expect_err("short payload must fail");
         assert!(matches!(err, SealError::MissingSignature));
     }
 
     #[test]
     fn verify_signature_rejects_unsigned_payload() {
+        let audit = audit::AuditLogger::from_env();
         let payload = vec![0xAA; 200];
-        let err = verify_signature(&payload).expect_err("unsigned payload must fail");
+        let err = verify_signature(&payload, &audit).expect_err("unsigned payload must fail");
         assert!(matches!(err, SealError::MissingSignature));
     }
 }
