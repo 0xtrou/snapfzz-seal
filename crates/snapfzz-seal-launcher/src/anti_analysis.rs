@@ -106,7 +106,7 @@ pub fn detect_virtual_machine() -> bool {
 }
 
 pub fn is_being_analyzed() -> bool {
-    detect_debugger()
+    detect_debugger() || detect_virtual_machine()
 }
 
 pub fn poison_environment() {

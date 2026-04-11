@@ -165,9 +165,11 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
+          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
+            echo "✓ PyInstaller E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
+          else
+            echo "✓ PyInstaller E2E complete (exit=$LAUNCH_EXIT)"
           fi
-
-          echo "✓ PyInstaller E2E complete (exit=$LAUNCH_EXIT)"
 
   e2e-nuitka:
     name: E2E - Nuitka
@@ -254,9 +256,11 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
+          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
+            echo "✓ Nuitka E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
+          else
+            echo "✓ Nuitka E2E complete (exit=$LAUNCH_EXIT)"
           fi
-
-          echo "✓ Nuitka E2E complete (exit=$LAUNCH_EXIT)"
 
   e2e-golang:
     name: E2E - Go
@@ -335,9 +339,11 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
+          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
+            echo "✓ Go E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
+          else
+            echo "✓ Go E2E complete (exit=$LAUNCH_EXIT)"
           fi
-
-          echo "✓ Go E2E complete (exit=$LAUNCH_EXIT)"
 
   upload-artifacts:
     name: Upload Artifacts
