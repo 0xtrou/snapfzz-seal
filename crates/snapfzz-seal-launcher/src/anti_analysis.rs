@@ -60,31 +60,40 @@ impl Default for TimingProfile {
     }
 }
 
+#[allow(dead_code)]
 pub fn detect_debugger() -> bool {
+    detect_debugger_reason().is_some()
+}
+
+/// Returns the name of the first anti-analysis check that triggered, or
+/// `None` if all checks passed cleanly.  The returned string is suitable
+/// for use as the `check` field of an [`crate::audit::AuditEvent::AnalysisDetected`]
+/// event.
+pub fn detect_debugger_reason() -> Option<&'static str> {
     #[cfg(target_os = "linux")]
     {
         if check_tracer_pid() {
             tracing::warn!("debugger detection hit TracerPid check");
-            return true;
+            return Some("tracer_pid");
         }
 
         if detect_ptrace() {
             tracing::warn!("debugger detection hit ptrace check");
-            return true;
+            return Some("ptrace_traceme");
         }
     }
 
     if detect_breakpoints() {
         tracing::warn!("debugger detection hit software-breakpoint check");
-        return true;
+        return Some("breakpoint_scan");
     }
 
     if timing_check_with_profile(&TimingProfile::default()) {
         tracing::warn!("debugger detection hit timing anomaly check");
-        return true;
+        return Some("timing_anomaly");
     }
 
-    false
+    None
 }
 
 #[cfg(feature = "ci-bypass")]
@@ -111,15 +120,25 @@ pub fn detect_virtual_machine() -> bool {
     false
 }
 
+#[allow(dead_code)]
 pub fn is_being_analyzed() -> bool {
+    analysis_check_name().is_some()
+}
+
+/// Returns the name of the first triggered analysis-detection check, or
+/// `None` when the process appears clean.
+///
+/// The CI-bypass env-var short-circuits the entire check so tests are
+/// unaffected.
+pub fn analysis_check_name() -> Option<&'static str> {
     // This bypass is compiled in ONLY when the `ci-bypass` feature is enabled.
     // Release binaries built without that feature have zero bypass code paths,
     // so the env-var name never appears in the binary's string table.
     #[cfg(feature = "ci-bypass")]
     if std::env::var("SNAPFZZ_SEAL_SKIP_ANALYSIS_CHECK").is_ok() {
-        return false;
+        return None;
     }
-    detect_debugger()
+    detect_debugger_reason()
 }
 
 #[cfg(feature = "ci-bypass")]

@@ -564,14 +564,9 @@ fn run_memfd_child<Ops: MemfdOps>(ops: &Ops, binary_data: &[u8], config: &ExecCo
                 std::io::Error::last_os_error()
             );
         }
-
-        // Seccomp filter: comprehensive allowlist covering Go and Python batch
-        // agent runtimes. Categories: I/O, filesystem, memory, process/thread
-        // lifecycle, credentials, scheduling, futex, signals, time, polling,
-        // networking, IPC, system info, entropy/security, memfd/PyInstaller.
-        if let Err(err) = crate::seccomp::apply_seccomp_filter() {
-            eprintln!("seccomp filter failed: {err} (continuing without seccomp)");
-        }
+        // Note: seccomp filter is applied in the parent process (run() in
+        // lib.rs) before key derivation and is inherited by this child process
+        // across fork+exec — no need to re-apply it here.
     }
 
     let exec_result = (|| -> Result<(), SealError> {

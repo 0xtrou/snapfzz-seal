@@ -9,7 +9,7 @@ use snapfzz_seal_core::{
         compute_binary_integrity_hash, derive_key_with_integrity_from_binary,
         find_integrity_regions,
     },
-    payload::{pack_payload_with_mode, write_footer},
+    payload::{pack_payload_with_footer, write_footer},
     types::{AgentMode, BackendType, LAUNCHER_PAYLOAD_SENTINEL, PayloadFooter},
 };
 use std::{io::Cursor, path::PathBuf};
@@ -69,9 +69,6 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
 
     let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_tamper)?;
 
-    let encrypted_payload =
-        pack_payload_with_mode(Cursor::new(&agent_elf_bytes), &integrity_key, config.mode)?;
-
     let mut original_hash = [0_u8; 32];
     original_hash.copy_from_slice(&Sha256::digest(&agent_elf_bytes));
 
@@ -85,6 +82,14 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
         launcher_hash,
         backend_type,
     };
+
+    let encrypted_payload = pack_payload_with_footer(
+        Cursor::new(&agent_elf_bytes),
+        &integrity_key,
+        config.mode,
+        Some(&footer),
+    )?;
+
     let footer_bytes = write_footer(&footer);
 
     let mut assembled = Vec::with_capacity(
@@ -109,7 +114,7 @@ mod tests {
             compute_binary_integrity_hash, derive_key_with_integrity_from_binary,
             find_integrity_regions,
         },
-        payload::{pack_payload_with_mode, read_footer, unpack_payload, write_footer},
+        payload::{pack_payload_with_mode, read_footer, unpack_payload_with_footer, write_footer},
         types::{
             AgentMode, LAUNCHER_PAYLOAD_SENTINEL, LAUNCHER_TAMPER_MARKER, PayloadFooter,
             SHAMIR_TOTAL_SHARES, get_secret_marker,
@@ -273,9 +278,12 @@ mod tests {
             LAUNCHER_PAYLOAD_SENTINEL
         );
         let payload_section = &assembled[payload_start..payload_start + payload_len];
+        let footer_section = &assembled[payload_start + payload_len..];
+        let footer = read_footer(footer_section).expect("footer should parse");
 
-        let (decrypted, _header) = unpack_payload(Cursor::new(payload_section), &integrity_key)
-            .expect("payload should unpack");
+        let (decrypted, _header) =
+            unpack_payload_with_footer(Cursor::new(payload_section), &integrity_key, Some(&footer))
+                .expect("payload should unpack");
 
         assert_eq!(decrypted, agent_bytes);
     }

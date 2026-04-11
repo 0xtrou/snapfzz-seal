@@ -27,6 +27,15 @@ pub fn pack_payload_with_mode(
     key: &[u8; 32],
     mode: AgentMode,
 ) -> Result<Vec<u8>, SealError> {
+    pack_payload_with_footer(plaintext.by_ref(), key, mode, None)
+}
+
+pub fn pack_payload_with_footer(
+    mut plaintext: impl Read,
+    key: &[u8; 32],
+    mode: AgentMode,
+    footer: Option<&PayloadFooter>,
+) -> Result<Vec<u8>, SealError> {
     let mut plaintext_bytes = Vec::new();
     plaintext.read_to_end(&mut plaintext_bytes)?;
 
@@ -38,6 +47,8 @@ pub fn pack_payload_with_mode(
         plaintext_bytes.len().div_ceil(CHUNK_SIZE) as u32
     };
 
+    let footer_bytes: Option<[u8; FOOTER_SIZE]> = footer.map(write_footer);
+
     let header_hmac = compute_header_hmac(
         &MAGIC_BYTES,
         VERSION_V1,
@@ -45,6 +56,7 @@ pub fn pack_payload_with_mode(
         FMT_STREAM,
         chunk_count,
         key,
+        footer_bytes.as_ref().map(|b| b.as_slice()),
     );
 
     let header = PayloadHeader {
@@ -68,6 +80,14 @@ pub fn unpack_payload(
     mut payload: impl Read,
     key: &[u8; 32],
 ) -> Result<(Vec<u8>, PayloadHeader), SealError> {
+    unpack_payload_with_footer(payload.by_ref(), key, None)
+}
+
+pub fn unpack_payload_with_footer(
+    mut payload: impl Read,
+    key: &[u8; 32],
+    footer: Option<&PayloadFooter>,
+) -> Result<(Vec<u8>, PayloadHeader), SealError> {
     let mut payload_bytes = Vec::new();
     payload.read_to_end(&mut payload_bytes)?;
 
@@ -79,6 +99,8 @@ pub fn unpack_payload(
 
     let mut header = parse_header(&payload_bytes[..HEADER_SIZE])?;
 
+    let footer_bytes: Option<[u8; FOOTER_SIZE]> = footer.map(write_footer);
+
     let expected_hmac = compute_header_hmac(
         &header.magic,
         header.version,
@@ -86,6 +108,7 @@ pub fn unpack_payload(
         header.fmt_version,
         header.chunk_count,
         key,
+        footer_bytes.as_ref().map(|b| b.as_slice()),
     );
 
     if !bool::from(header.header_hmac.ct_eq(&expected_hmac)) {
@@ -257,11 +280,15 @@ fn compute_header_hmac(
     fmt_version: u16,
     chunk_count: u32,
     key: &[u8; 32],
+    footer_bytes: Option<&[u8]>,
 ) -> [u8; 32] {
     let header_without_hmac =
         serialize_header_without_hmac(magic, version, enc_alg, fmt_version, chunk_count);
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC-SHA256 accepts any key length");
     mac.update(&header_without_hmac);
+    if let Some(footer) = footer_bytes {
+        mac.update(footer);
+    }
 
     let mut out = [0_u8; 32];
     out.copy_from_slice(&mac.finalize().into_bytes());
@@ -414,6 +441,7 @@ mod tests {
                 FMT_STREAM,
                 1,
                 &key,
+                None,
             ),
             mode: AgentMode::Batch,
         };
@@ -590,6 +618,7 @@ mod tests {
             FMT_STREAM,
             1,
             &key,
+            None,
         );
         let b = compute_header_hmac(
             &MAGIC_BYTES,
@@ -598,6 +627,7 @@ mod tests {
             FMT_STREAM,
             2,
             &key,
+            None,
         );
 
         assert_ne!(a, b);
@@ -708,5 +738,117 @@ mod tests {
         assert!(
             matches!(err, SealError::InvalidPayload(message) if message.contains("invalid payload mode byte"))
         );
+    }
+
+    #[test]
+    fn pack_unpack_with_footer_round_trip() {
+        let key = [70_u8; 32];
+        let plaintext = b"footer-round-trip-body";
+        let footer = PayloadFooter {
+            original_hash: [0xAA; 32],
+            launcher_hash: [0xBB; 32],
+            backend_type: BackendType::Go,
+        };
+
+        let payload =
+            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
+                .expect("pack with footer should succeed");
+        let (decrypted, header) =
+            unpack_payload_with_footer(Cursor::new(payload), &key, Some(&footer))
+                .expect("unpack with footer should succeed");
+
+        assert_eq!(decrypted, plaintext.as_slice());
+        assert_eq!(header.mode, AgentMode::Batch);
+    }
+
+    #[test]
+    fn tampered_backend_type_causes_hmac_failure() {
+        let key = [71_u8; 32];
+        let plaintext = b"backend-type-tamper-test";
+        let footer = PayloadFooter {
+            original_hash: [0x11; 32],
+            launcher_hash: [0x22; 32],
+            backend_type: BackendType::Go,
+        };
+
+        let payload =
+            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
+                .expect("pack should succeed");
+
+        // Attacker flips backend_type from Go (0x01) to PyInstaller (0x02)
+        let tampered_footer = PayloadFooter {
+            original_hash: [0x11; 32],
+            launcher_hash: [0x22; 32],
+            backend_type: BackendType::PyInstaller,
+        };
+
+        let err = unpack_payload_with_footer(Cursor::new(payload), &key, Some(&tampered_footer))
+            .expect_err("tampered backend_type must cause HMAC failure");
+        assert!(matches!(err, SealError::DecryptionFailed(_)));
+    }
+
+    #[test]
+    fn footer_authenticated_payload_rejects_no_footer_unpack() {
+        let key = [72_u8; 32];
+        let plaintext = b"footer-required";
+        let footer = PayloadFooter {
+            original_hash: [0x33; 32],
+            launcher_hash: [0x44; 32],
+            backend_type: BackendType::Nuitka,
+        };
+
+        let payload =
+            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
+                .expect("pack should succeed");
+
+        // Unpack without footer should fail: HMAC was computed with footer bytes
+        let err = unpack_payload(Cursor::new(payload), &key)
+            .expect_err("unpack without footer must fail when packed with footer");
+        assert!(matches!(err, SealError::DecryptionFailed(_)));
+    }
+
+    #[test]
+    fn no_footer_pack_rejects_footer_unpack() {
+        let key = [73_u8; 32];
+        let plaintext = b"no-footer-pack";
+
+        let payload = pack_payload_with_mode(Cursor::new(plaintext), &key, AgentMode::Batch)
+            .expect("pack without footer should succeed");
+
+        let footer = PayloadFooter {
+            original_hash: [0x55; 32],
+            launcher_hash: [0x66; 32],
+            backend_type: BackendType::Go,
+        };
+
+        // Unpack with a footer when pack used none should fail: HMAC mismatch
+        let err = unpack_payload_with_footer(Cursor::new(payload), &key, Some(&footer))
+            .expect_err("unpack with spurious footer must fail");
+        assert!(matches!(err, SealError::DecryptionFailed(_)));
+    }
+
+    #[test]
+    fn tampered_original_hash_causes_hmac_failure() {
+        let key = [74_u8; 32];
+        let plaintext = b"original-hash-tamper-test";
+        let footer = PayloadFooter {
+            original_hash: [0x77; 32],
+            launcher_hash: [0x88; 32],
+            backend_type: BackendType::Go,
+        };
+
+        let payload =
+            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
+                .expect("pack should succeed");
+
+        let tampered_footer = PayloadFooter {
+            original_hash: [0x78; 32], // flip one byte
+            launcher_hash: [0x88; 32],
+            backend_type: BackendType::Go,
+        };
+
+        let err = unpack_payload_with_footer(Cursor::new(payload), &key, Some(&tampered_footer))
+            .expect_err("tampered original_hash must cause HMAC failure");
+        assert!(matches!(err, SealError::DecryptionFailed(_)));
     }
 }

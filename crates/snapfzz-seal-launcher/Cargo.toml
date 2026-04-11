@@ -8,6 +8,9 @@ edition = "2024"
 # Only enable this feature when building for CI or local development where the
 # analysis-check bypass is needed.  Release binaries must never include it.
 ci-bypass = []
+# Skip compile-time public-key pinning check (for development/testing only).
+# In production builds, set SNAPFZZ_SEAL_ROOT_PUBKEY_HEX at build time instead.
+skip-pubkey-pin = []
 
 [[bin]]
 name = "seal-launcher"
@@ -23,11 +26,13 @@ memfd = { workspace = true }
 nix = { workspace = true, features = ["process", "fs", "sched", "signal", "ptrace"] }
 zeroize = { workspace = true }
 hex = { workspace = true }
+hkdf = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 sha2 = "0.10"
+hmac = { workspace = true }
 chrono = "0.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]

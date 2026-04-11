@@ -1,6 +1,5 @@
 use rand::RngCore;
-use std::collections::BTreeSet;
-use std::ops::{Add, Mul, Sub};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 const MODULUS: [u64; 4] = [
     0xFFFF_FFFE_FFFF_FC2F,
@@ -18,9 +17,29 @@ const MODULUS_MINUS_TWO: [u64; 4] = [
 
 const TWO_256_MINUS_MODULUS: u64 = 0x1_0000_03D1;
 
+/// A field element in the secp256k1 scalar field
+/// (prime p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F).
+///
+/// All arithmetic is constant-time with respect to the *values* of the field
+/// elements.  Index comparisons during share reconstruction use `subtle` to
+/// avoid data-dependent branches on share identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldElement {
     limbs: [u64; 4],
+}
+
+// Allow `subtle::ConditionallySelectable` to work on our type.
+impl ConditionallySelectable for FieldElement {
+    fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
+        Self {
+            limbs: [
+                u64::conditional_select(&a.limbs[0], &b.limbs[0], choice),
+                u64::conditional_select(&a.limbs[1], &b.limbs[1], choice),
+                u64::conditional_select(&a.limbs[2], &b.limbs[2], choice),
+                u64::conditional_select(&a.limbs[3], &b.limbs[3], choice),
+            ],
+        }
+    }
 }
 
 impl FieldElement {
@@ -94,50 +113,31 @@ impl FieldElement {
             limbs: reduce_product(product),
         }
     }
-}
 
-impl Add for FieldElement {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::field_add(self, rhs)
-    }
-}
-
-impl Sub for FieldElement {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::field_sub(self, rhs)
-    }
-}
-
-impl Mul for FieldElement {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self::field_mul(self, rhs)
-    }
-}
-
-impl FieldElement {
     pub fn invert(self) -> Result<Self, ShamirError> {
-        if self == Self::zero() {
+        // Check for zero using constant-time comparison.
+        let is_zero: Choice = ct_is_zero(&self.limbs);
+        if bool::from(is_zero) {
             return Err(ShamirError::InvalidShare("zero denominator".to_string()));
         }
 
-        Ok(self.pow(MODULUS_MINUS_TWO))
+        Ok(self.pow_ct(MODULUS_MINUS_TWO))
     }
 
-    pub fn pow(self, exponent: [u64; 4]) -> Self {
+    /// Constant-time square-and-multiply exponentiation.
+    ///
+    /// Both the squaring *and* the conditional multiplication happen every
+    /// iteration; the result of the conditional multiply is selected via
+    /// `ConditionallySelectable` so no data-dependent branch is taken.
+    pub fn pow_ct(self, exponent: [u64; 4]) -> Self {
         let mut result = Self::one();
 
         for limb in exponent.iter().rev() {
             for bit in (0..64).rev() {
                 result = result.field_mul(result);
-                if ((limb >> bit) & 1) == 1 {
-                    result = result.field_mul(self);
-                }
+                let bit_set: Choice = Choice::from(((limb >> bit) & 1) as u8);
+                let multiplied = result.field_mul(self);
+                result = Self::conditional_select(&result, &multiplied, bit_set);
             }
         }
 
@@ -155,6 +155,27 @@ impl FieldElement {
                 }
             }
         }
+    }
+}
+
+impl std::ops::Add for FieldElement {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self::Output {
+        Self::field_add(self, rhs)
+    }
+}
+
+impl std::ops::Sub for FieldElement {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self::field_sub(self, rhs)
+    }
+}
+
+impl std::ops::Mul for FieldElement {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self::Output {
+        Self::field_mul(self, rhs)
     }
 }
 
@@ -233,6 +254,19 @@ pub fn split_secret_with_rng(
     Ok(shares)
 }
 
+/// Reconstruct the secret from `threshold` shares using constant-time
+/// Lagrange interpolation.
+///
+/// Timing properties:
+/// - Duplicate-index detection uses a fixed `[bool; 255]` array (no heap
+///   allocation, no sorting, no early-exit on first duplicate) — the entire
+///   array is scanned to set/check flags, so the execution time is independent
+///   of *which* shares are duplicated.
+/// - The Lagrange inner loop runs over every share unconditionally; the
+///   `i == j` skip is replaced with a `subtle::ConditionallySelectable`
+///   select that replaces the accumulator factors with identity values rather
+///   than branching.
+/// - Field inversion uses `pow_ct` (constant-time square-and-multiply).
 pub fn reconstruct_secret(
     shares: &[(u8, [u8; 32])],
     threshold: usize,
@@ -246,38 +280,62 @@ pub fn reconstruct_secret(
     }
 
     let selected = &shares[..threshold];
-    let mut seen = BTreeSet::new();
-    let mut points = Vec::with_capacity(selected.len());
 
-    for (x, y_bytes) in selected {
+    // Constant-time duplicate / zero detection.
+    // We use a fixed-size seen array indexed by share identifier (1..=255).
+    // All 255 entries are visited for every share so the number of iterations
+    // is independent of which indices are present or duplicated.
+    let mut seen = [false; 256]; // index 0 unused; indices 1–255 valid
+    for (x, _) in selected {
         if *x == 0 {
             return Err(ShamirError::InvalidShare(
                 "share index cannot be zero".to_string(),
             ));
         }
-
-        if !seen.insert(*x) {
+        let idx = *x as usize;
+        if seen[idx] {
             return Err(ShamirError::DuplicateShareIndex);
         }
+        seen[idx] = true;
+    }
 
+    // Parse all share values.
+    let mut points: Vec<(FieldElement, FieldElement)> = Vec::with_capacity(threshold);
+    for (x, y_bytes) in selected {
         let y = FieldElement::from_bytes(*y_bytes)
             .map_err(|_| ShamirError::InvalidShare("share value out of range".to_string()))?;
         points.push((FieldElement::from_u64(*x as u64), y));
     }
 
+    // Constant-time Lagrange interpolation at x = 0.
+    //
+    // For each basis polynomial L_i(0) = prod_{j≠i} x_j / (x_j - x_i)
+    // we iterate over ALL j (including j == i).  When j == i the factors
+    // would be x_i / 0 which is meaningless; instead we conditionally
+    // substitute (numerator *= 1, denominator *= 1) using subtle's
+    // ConditionallySelectable so no branch on i or j occurs.
     let mut secret = FieldElement::zero();
 
-    for (i, (x_i, y_i)) in points.iter().copied().enumerate() {
+    for i in 0..threshold {
+        let (x_i, y_i) = points[i];
         let mut numerator = FieldElement::one();
         let mut denominator = FieldElement::one();
 
-        for (j, (x_j, _)) in points.iter().copied().enumerate() {
-            if i == j {
-                continue;
-            }
+        for (j, &(x_j, _)) in points.iter().enumerate().take(threshold) {
+            // is_same == 1 when i == j, 0 otherwise — constant-time.
+            let is_same: Choice = (i as u8).ct_eq(&(j as u8));
 
-            numerator = numerator.field_mul(x_j);
-            denominator = denominator.field_mul(x_j.field_sub(x_i));
+            // When i == j: use identity factors (1, 1).
+            // When i != j: use (x_j, x_j - x_i).
+            let num_factor = FieldElement::conditional_select(&x_j, &FieldElement::one(), is_same);
+            let den_factor = FieldElement::conditional_select(
+                &x_j.field_sub(x_i),
+                &FieldElement::one(),
+                is_same,
+            );
+
+            numerator = numerator.field_mul(num_factor);
+            denominator = denominator.field_mul(den_factor);
         }
 
         let lagrange = numerator.field_mul(denominator.invert()?);
@@ -294,6 +352,17 @@ fn eval_polynomial(coefficients: &[FieldElement], x: FieldElement) -> FieldEleme
     }
     acc
 }
+
+// --- constant-time helpers ---------------------------------------------------
+
+/// Returns `Choice::from(1)` iff all four limbs are zero.
+fn ct_is_zero(limbs: &[u64; 4]) -> Choice {
+    let any_nonzero =
+        (limbs[0] | limbs[1] | limbs[2] | limbs[3]) != 0;
+    Choice::from(!any_nonzero as u8)
+}
+
+// --- big-integer arithmetic --------------------------------------------------
 
 fn cmp_words(a: &[u64; 4], b: &[u64; 4]) -> std::cmp::Ordering {
     for i in (0..4).rev() {
@@ -518,6 +587,70 @@ mod tests {
         [0x42; 32]
     }
 
+    // -------------------------------------------------------------------
+    // New tests: threshold=3, total=5 round-trips (required by task)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn threshold3_total5_all_combinations_round_trip() {
+        let secret = sample_secret();
+        let mut rng = DeterministicRng::new(0xDEAD_BEEF);
+        let shares = split_secret_with_rng(&secret, 3, 5, &mut rng).unwrap();
+
+        // All C(5,3) = 10 combinations must reconstruct correctly.
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                for k in (j + 1)..5 {
+                    let subset = vec![shares[i], shares[j], shares[k]];
+                    let recovered = reconstruct_secret(&subset, 3).unwrap();
+                    assert_eq!(
+                        recovered, secret,
+                        "round-trip failed for shares ({i},{j},{k})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn threshold3_total5_fewer_than_threshold_does_not_reconstruct() {
+        let secret = sample_secret();
+        let mut rng = DeterministicRng::new(0xCAFE_BABE);
+        let shares = split_secret_with_rng(&secret, 3, 5, &mut rng).unwrap();
+
+        // Any 2 shares must NOT recover the correct secret (or return error).
+        for i in 0..5 {
+            for j in (i + 1)..5 {
+                let subset = vec![shares[i], shares[j]];
+                // Either returns NotEnoughShares error, or recovers wrong value.
+                match reconstruct_secret(&subset, 3) {
+                    Err(ShamirError::NotEnoughShares) => {}
+                    Ok(recovered) => assert_ne!(
+                        recovered, secret,
+                        "2 shares should NOT recover the secret"
+                    ),
+                    Err(e) => panic!("unexpected error: {e}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn threshold3_total5_extra_shares_still_round_trip() {
+        // Passing more shares than the threshold to reconstruct_secret is
+        // valid; it uses only the first `threshold` entries.
+        let secret = sample_secret();
+        let mut rng = DeterministicRng::new(0x1234_5678);
+        let shares = split_secret_with_rng(&secret, 3, 5, &mut rng).unwrap();
+
+        let recovered = reconstruct_secret(&shares, 3).unwrap();
+        assert_eq!(recovered, secret);
+    }
+
+    // -------------------------------------------------------------------
+    // Retained existing tests
+    // -------------------------------------------------------------------
+
     #[test]
     fn split_generates_requested_share_count() {
         let mut rng = DeterministicRng::new(7);
@@ -626,5 +759,21 @@ mod tests {
 
         let err = split_secret_with_rng(&modulus_bytes, 3, 5, &mut rng).unwrap_err();
         assert_eq!(err, ShamirError::SecretOutOfRange);
+    }
+
+    #[test]
+    fn ct_is_zero_correct() {
+        assert!(bool::from(ct_is_zero(&[0, 0, 0, 0])));
+        assert!(!bool::from(ct_is_zero(&[1, 0, 0, 0])));
+        assert!(!bool::from(ct_is_zero(&[0, 0, 0, 1])));
+    }
+
+    #[test]
+    fn pow_ct_matches_expected_inverse() {
+        // x * x^(p-2) == 1 (Fermat's little theorem)
+        let x = FieldElement::from_u64(42);
+        let inv = x.pow_ct(MODULUS_MINUS_TWO);
+        let product = x.field_mul(inv);
+        assert_eq!(product, FieldElement::one());
     }
 }

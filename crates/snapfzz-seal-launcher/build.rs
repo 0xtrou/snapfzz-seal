@@ -107,4 +107,9 @@ const _: [(); 416] = [(); core::mem::size_of::<LauncherMarkers>()];"
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=BUILD_ID");
+    println!("cargo:rerun-if-env-changed=SNAPFZZ_SEAL_ROOT_PUBKEY_HEX");
+
+    if let Ok(pubkey_hex) = std::env::var("SNAPFZZ_SEAL_ROOT_PUBKEY_HEX") {
+        println!("cargo:rustc-env=SNAPFZZ_SEAL_ROOT_PUBKEY_HEX={pubkey_hex}");
+    }
 }

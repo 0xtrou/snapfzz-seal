@@ -52,6 +52,12 @@ use zeroize::{Zeroize, Zeroizing};
 const SIG_MAGIC: &[u8; 4] = b"ASL\x02";
 const SIG_BLOCK_SIZE: usize = 100;
 
+/// Compile-time pinned root public key (ed25519, hex-encoded).
+/// Set at build time via `SNAPFZZ_SEAL_ROOT_PUBKEY_HEX` environment variable.
+/// When `None`, pubkey pinning is skipped (development / testing only).
+#[cfg(not(feature = "skip-pubkey-pin"))]
+const ROOT_PUBKEY_HEX: Option<&str> = option_env!("SNAPFZZ_SEAL_ROOT_PUBKEY_HEX");
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum FingerprintMode {
     Stable,
@@ -100,6 +106,36 @@ fn verify_signature(raw_binary: &[u8], audit: &audit::AuditLogger) -> Result<(),
     let data = &raw_binary[..sig_start];
     let pubkey_fingerprint = hex::encode(&pubkey[..16]);
 
+    // If a root pubkey is pinned at compile time, reject any binary whose
+    // embedded key does not match — this prevents TOFU key substitution attacks.
+    #[cfg(not(feature = "skip-pubkey-pin"))]
+    if let Some(pinned_hex) = ROOT_PUBKEY_HEX {
+        let pinned_bytes = hex::decode(pinned_hex).map_err(|_| {
+            SealError::InvalidInput(
+                "SNAPFZZ_SEAL_ROOT_PUBKEY_HEX is not valid hex".to_string(),
+            )
+        })?;
+        if pinned_bytes.len() != 32 {
+            return Err(SealError::InvalidInput(
+                "SNAPFZZ_SEAL_ROOT_PUBKEY_HEX must be 64 hex chars (32 bytes)".to_string(),
+            ));
+        }
+        use subtle::ConstantTimeEq as _;
+        if pubkey.ct_eq(pinned_bytes.as_slice()).into() {
+            tracing::debug!("embedded pubkey matches pinned root pubkey");
+        } else {
+            tracing::error!(
+                pubkey_fingerprint = %pubkey_fingerprint,
+                "embedded pubkey does not match pinned root pubkey — key substitution attack rejected"
+            );
+            audit.log(audit::AuditEvent::SignatureInvalid {
+                payload_hash,
+                reason: "embedded pubkey does not match pinned root pubkey".to_string(),
+            });
+            return Err(SealError::InvalidSignature);
+        }
+    }
+
     match signing::verify(&pubkey, data, &signature)? {
         true => {
             tracing::info!(
@@ -131,6 +167,10 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
 
     let raw_binary = load_raw_binary(cli.payload.as_deref())?;
 
+    // Verify signature FIRST — before any payload parsing or sentinel scanning.
+    // This ensures an attacker cannot exploit parser vulnerabilities on unsigned input.
+    verify_signature(&raw_binary, &audit)?;
+
     // Strip signature block BEFORE extracting payload/footer so offsets are correct.
     // Binary layout: [launcher | sentinel | encrypted_payload | footer(65) | sig_block(100)]
     // After stripping: [launcher | sentinel | encrypted_payload | footer(65)]
@@ -141,17 +181,16 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     let launcher_bytes_for_integrity = raw_for_integrity;
 
     validate_payload_header(&payload_bytes)?;
-    verify_signature(&raw_binary, &audit)?;
     let footer = extract_footer(&payload_bytes).map_err(|_| {
         SealError::InvalidPayload("missing or corrupted payload footer".to_string())
     })?;
 
     verify_launcher_integrity(&footer.launcher_hash, raw_for_integrity, &audit)?;
 
-    if anti_analysis::is_being_analyzed() {
-        tracing::error!("analysis detected, aborting launcher execution");
+    if let Some(check_name) = anti_analysis::analysis_check_name() {
+        tracing::error!("analysis detected (check={check_name}), aborting launcher execution");
         audit.log(audit::AuditEvent::AnalysisDetected {
-            check: "anti_analysis".to_string(),
+            check: check_name.to_string(),
         });
         return Err(SealError::InvalidInput(
             "analysis environment detected, refusing to continue".to_string(),
@@ -161,9 +200,35 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
     let protections = protection::apply_protections()?;
     tracing::info!(?protections, "anti-debug protections evaluated");
 
+    // Poison environment BEFORE loading the real master secret so that any
+    // observer (debugger, timing attack) sees the decoy values first.
     anti_analysis::poison_environment();
 
-    let collector = FingerprintCollector::new();
+    // Apply the seccomp syscall allowlist as early as possible — after
+    // protections and anti-analysis checks, but BEFORE any sensitive code
+    // (key loading, HKDF, AES-GCM decryption).  On Linux, seccomp filters are
+    // inherited across exec(2), so this single call covers both the launcher's
+    // security-sensitive code and the exec'd child agent's runtime syscalls
+    // (Go goroutines, Python/PyInstaller, Nuitka).
+    seccomp::apply_seccomp_filter().map_err(|err| {
+        tracing::error!(%err, "failed to apply seccomp filter");
+        err
+    })?;
+
+    let mut master_secret = load_master_secret(raw_for_integrity)?;
+
+    // Derive a per-build HMAC key from master_secret to prevent fingerprint
+    // hashes from being reproduced by anyone who does not know the secret.
+    let fp_hmac_key = {
+        use hkdf::Hkdf;
+        let hk = Hkdf::<sha2::Sha256>::new(None, &master_secret);
+        let mut okm = [0u8; 32];
+        hk.expand(b"snapfzz-seal/fingerprint-hmac-key/v1", &mut okm)
+            .expect("valid length");
+        okm
+    };
+
+    let collector = FingerprintCollector::with_app_key(fp_hmac_key);
     let snapshot = match cli.fingerprint_mode {
         FingerprintMode::Stable => collector
             .collect_stable_only()
@@ -185,8 +250,6 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         sandbox_fp: sandbox_fp.clone(),
         user_fp: user_fp.clone(),
     });
-
-    let mut master_secret = load_master_secret(raw_for_integrity)?;
 
     let mut decryption_key = derive_decryption_key(
         &master_secret,
@@ -258,21 +321,41 @@ pub fn run(cli: Cli) -> Result<(), SealError> {
         backend: backend_str.clone(),
     });
 
+    // All three ELF-based backends (Go, PyInstaller, Nuitka) are executed via
+    // memfd_create + fexecve so the decrypted binary never touches the filesystem.
+    // PyInstaller and Nuitka produce self-contained ELF executables that bundle
+    // their interpreter, stdlib, and data — they can be exec'd from an anonymous
+    // memory file descriptor exactly like a statically-linked Go binary.
+    //
+    // TempFileExecutor is the fallback for kernels < 3.17 that lack memfd_create,
+    // and for non-Linux targets where KernelMemfdOps always returns an error.
+    //
+    // NOTE: No ELF-section stripping is applied to binary_data before writing to
+    // memfd.  Nuitka binaries carry attached payload data after the ELF image
+    // (see commit edeeb7a); passing binary_data unchanged preserves that payload.
     let exec_result = match backend_type {
-        BackendType::Go => {
+        BackendType::Go | BackendType::PyInstaller | BackendType::Nuitka => {
             let executor = MemfdExecutor::new(KernelMemfdOps);
-            executor.execute(decrypted.as_slice(), &config)
-        }
-        BackendType::PyInstaller | BackendType::Nuitka => {
-            let executor = TempFileExecutor::new();
-            executor.execute(decrypted.as_slice(), &config)
+            executor
+                .execute(decrypted.as_slice(), &config)
+                .or_else(|err| {
+                    tracing::warn!(
+                        %err,
+                        backend = %backend_str,
+                        "memfd exec failed, falling back to temp-file executor"
+                    );
+                    TempFileExecutor::new().execute(decrypted.as_slice(), &config)
+                })
         }
         BackendType::Unknown => {
             let executor = MemfdExecutor::new(KernelMemfdOps);
             executor
                 .execute(decrypted.as_slice(), &config)
-                .or_else(|_| {
-                    tracing::warn!("memfd exec failed for unknown backend, using temp-file");
+                .or_else(|err| {
+                    tracing::warn!(
+                        %err,
+                        "memfd exec failed for unknown backend, falling back to temp-file executor"
+                    );
                     TempFileExecutor::new().execute(decrypted.as_slice(), &config)
                 })
         }
@@ -1431,7 +1514,10 @@ mod tests {
     }
 
     #[test]
-    fn run_returns_invalid_payload_for_bad_header_before_antidebug() {
+    fn run_returns_missing_signature_for_unsigned_payload_before_parse() {
+        // Since verify_signature is now called BEFORE payload parsing, an
+        // unsigned binary (no ASL\x02 sig block) must fail with MissingSignature
+        // rather than InvalidPayload — this is the verify-before-parse guarantee.
         let payload_path = unique_temp_path("bad-payload");
         let mut assembled = LAUNCHER_PAYLOAD_SENTINEL.to_vec();
         assembled.extend_from_slice(b"not-a-valid-payload-header");
@@ -1444,8 +1530,11 @@ mod tests {
             verbose: false,
         };
 
-        let err = run(cli).expect_err("invalid header must fail");
-        assert!(matches!(err, SealError::InvalidPayload(_)));
+        let err = run(cli).expect_err("unsigned binary must fail");
+        assert!(
+            matches!(err, SealError::MissingSignature),
+            "expected MissingSignature (verify-before-parse), got: {err:?}"
+        );
 
         std::fs::remove_file(payload_path).unwrap();
     }

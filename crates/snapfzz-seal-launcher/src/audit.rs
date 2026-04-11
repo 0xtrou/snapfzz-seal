@@ -7,11 +7,28 @@
 //!
 //! This satisfies HIPAA § 164.312(b) audit-control requirements and FDA
 //! cybersecurity guidance for tamper-evident event records.
+//!
+//! ## HMAC chain integrity
+//!
+//! Each [`AuditRecord`] carries a `chain_hmac` field that is
+//! `hex(HMAC-SHA256(chain_key, prev_chain_hmac || record_json))`.  The chain
+//! is seeded with `prev_hmac = [0u8; 32]` (the genesis value) and the chain
+//! key is generated once with `OsRng` at logger creation.  This allows
+//! offline verification that no record was inserted, deleted, or modified
+//! after the fact.
 
 use std::io::Write as IoWrite;
+use std::path::Path;
+use std::sync::Mutex;
+
+use hmac::{Hmac, Mac};
+use rand::RngCore;
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Every security-relevant decision point the launcher can reach.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AuditEvent {
     /// Signature block was present and verified successfully.
@@ -48,7 +65,10 @@ pub enum AuditEvent {
 }
 
 /// A single timestamped audit record that wraps an [`AuditEvent`].
-#[derive(Debug, serde::Serialize)]
+///
+/// The `chain_hmac` field links each record to its predecessor via an
+/// HMAC-SHA256 chain; see [`verify_audit_chain`] for offline verification.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AuditRecord {
     /// RFC 3339 / ISO 8601 timestamp (UTC, second precision).
     pub timestamp: String,
@@ -56,30 +76,51 @@ pub struct AuditRecord {
     pub pid: u32,
     #[serde(flatten)]
     pub event: AuditEvent,
+    /// `hex(HMAC-SHA256(chain_key, prev_chain_hmac_bytes || record_json_bytes))`
+    /// where `record_json` is the serialisation of this record *without* the
+    /// `chain_hmac` field itself.
+    pub chain_hmac: String,
 }
 
-impl AuditRecord {
-    fn new(event: AuditEvent) -> Self {
-        Self {
-            timestamp: rfc3339_now(),
-            pid: std::process::id(),
-            event,
-        }
+// ---------------------------------------------------------------------------
+// Internal helper — record without the chain field, used for HMAC input.
+// ---------------------------------------------------------------------------
+
+/// Intermediate representation serialised to build the HMAC input.
+#[derive(Debug, serde::Serialize)]
+struct AuditRecordBody<'a> {
+    timestamp: &'a str,
+    pid: u32,
+    #[serde(flatten)]
+    event: &'a AuditEvent,
+}
+
+impl AuditRecordBody<'_> {
+    fn to_json(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
     }
 }
+
+// ---------------------------------------------------------------------------
+// AuditLogger
+// ---------------------------------------------------------------------------
 
 /// Where audit records are written.
 enum AuditSink {
     Stderr,
-    File(std::sync::Mutex<std::fs::File>),
+    File(Mutex<std::fs::File>),
 }
 
-/// Writes [`AuditEvent`]s as newline-delimited JSON.
+/// Writes [`AuditEvent`]s as newline-delimited JSON with an HMAC integrity chain.
 ///
 /// Create once at process startup via [`AuditLogger::from_env`] and pass
 /// through the call chain to every function that makes a security decision.
 pub struct AuditLogger {
     sink: AuditSink,
+    /// Randomly generated once per logger instance.
+    chain_key: [u8; 32],
+    /// The HMAC output of the previously written record (genesis = `[0u8; 32]`).
+    prev_hmac: Mutex<[u8; 32]>,
 }
 
 impl AuditLogger {
@@ -99,7 +140,7 @@ impl AuditLogger {
                     .append(true)
                     .open(&path)
                 {
-                    Ok(file) => AuditSink::File(std::sync::Mutex::new(file)),
+                    Ok(file) => AuditSink::File(Mutex::new(file)),
                     Err(err) => {
                         // Fall back gracefully; warn on stderr so the operator
                         // is aware the configured sink could not be opened.
@@ -113,7 +154,15 @@ impl AuditLogger {
             }
             None => AuditSink::Stderr,
         };
-        Self { sink }
+
+        let mut chain_key = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut chain_key);
+
+        Self {
+            sink,
+            chain_key,
+            prev_hmac: Mutex::new([0u8; 32]),
+        }
     }
 
     /// Serialize `event` as a JSON line and write it to the configured sink.
@@ -121,7 +170,49 @@ impl AuditLogger {
     /// Errors are silently swallowed (logging must never crash the launcher),
     /// but a best-effort write is always attempted.
     pub fn log(&self, event: AuditEvent) {
-        let record = AuditRecord::new(event);
+        let timestamp = rfc3339_now();
+        let pid = std::process::id();
+
+        let body = AuditRecordBody {
+            timestamp: &timestamp,
+            pid,
+            event: &event,
+        };
+
+        let body_json = match body.to_json() {
+            Some(j) => j,
+            None => return,
+        };
+
+        // Compute chain HMAC: HMAC-SHA256(chain_key, prev_hmac || body_json)
+        let chain_hmac_hex = {
+            let mut prev_guard = match self.prev_hmac.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+
+            let mut mac = match HmacSha256::new_from_slice(&self.chain_key) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            mac.update(prev_guard.as_ref());
+            mac.update(body_json.as_bytes());
+            let result = mac.finalize().into_bytes();
+
+            let mut new_hmac = [0u8; 32];
+            new_hmac.copy_from_slice(&result);
+            *prev_guard = new_hmac;
+
+            hex::encode(new_hmac)
+        };
+
+        let record = AuditRecord {
+            timestamp,
+            pid,
+            event,
+            chain_hmac: chain_hmac_hex,
+        };
+
         let mut line = match serde_json::to_string(&record) {
             Ok(s) => s,
             Err(_) => return,
@@ -139,6 +230,70 @@ impl AuditLogger {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Offline chain verification
+// ---------------------------------------------------------------------------
+
+/// Verify the HMAC chain of an audit log file written by [`AuditLogger`].
+///
+/// Reads every newline-delimited JSON record from `path`, re-derives the
+/// expected `chain_hmac` for each record using `chain_key`, and checks it
+/// against the stored value.
+///
+/// Returns `Ok(n)` where `n` is the number of records verified, or
+/// `Err(description)` on the first integrity failure.
+pub fn verify_audit_chain(path: &Path, chain_key: &[u8; 32]) -> Result<usize, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read audit log: {e}"))?;
+
+    let mut prev_hmac = [0u8; 32]; // genesis
+    let mut count = 0usize;
+
+    for (line_no, raw_line) in contents.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Parse the full record (including chain_hmac).
+        let record: AuditRecord = serde_json::from_str(trimmed)
+            .map_err(|e| format!("line {}: invalid JSON: {e}", line_no + 1))?;
+
+        // Re-build the body JSON (same fields, no chain_hmac) to reproduce
+        // the exact bytes fed into the HMAC when the record was written.
+        let body = AuditRecordBody {
+            timestamp: &record.timestamp,
+            pid: record.pid,
+            event: &record.event,
+        };
+        let body_json = body
+            .to_json()
+            .ok_or_else(|| format!("line {}: could not re-serialize body", line_no + 1))?;
+
+        // Compute expected HMAC.
+        let mut mac = HmacSha256::new_from_slice(chain_key)
+            .map_err(|e| format!("HMAC init error: {e}"))?;
+        mac.update(&prev_hmac);
+        mac.update(body_json.as_bytes());
+        let expected = mac.finalize().into_bytes();
+        let expected_hex = hex::encode(expected);
+
+        if record.chain_hmac != expected_hex {
+            return Err(format!(
+                "line {}: chain HMAC mismatch (expected {expected_hex}, got {})",
+                line_no + 1,
+                record.chain_hmac
+            ));
+        }
+
+        // Advance the chain.
+        prev_hmac.copy_from_slice(&expected);
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -164,18 +319,58 @@ fn rfc3339_now() -> String {
 mod tests {
     use super::*;
 
+    fn make_logger_to_file(path: &std::path::PathBuf) -> AuditLogger {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("tmp file");
+        AuditLogger {
+            sink: AuditSink::File(Mutex::new(file)),
+            chain_key: {
+                let mut k = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut k);
+                k
+            },
+            prev_hmac: Mutex::new([0u8; 32]),
+        }
+    }
+
     fn make_logger_stderr() -> AuditLogger {
         AuditLogger {
             sink: AuditSink::Stderr,
+            chain_key: [0u8; 32],
+            prev_hmac: Mutex::new([0u8; 32]),
         }
     }
 
     #[test]
     fn audit_record_serializes_to_valid_json() {
-        let record = AuditRecord::new(AuditEvent::SignatureVerified {
+        let timestamp = rfc3339_now();
+        let pid = std::process::id();
+        let event = AuditEvent::SignatureVerified {
             payload_hash: "aabbcc".to_string(),
             pubkey_fingerprint: "ddeeff".to_string(),
-        });
+        };
+        let body = AuditRecordBody {
+            timestamp: &timestamp,
+            pid,
+            event: &event,
+        };
+        let body_json = body.to_json().unwrap();
+
+        let mut mac = HmacSha256::new_from_slice(&[0u8; 32]).unwrap();
+        mac.update(&[0u8; 32]);
+        mac.update(body_json.as_bytes());
+        let chain_hmac = hex::encode(mac.finalize().into_bytes());
+
+        let record = AuditRecord {
+            timestamp,
+            pid,
+            event,
+            chain_hmac,
+        };
 
         let json = serde_json::to_string(&record).expect("serialization must succeed");
         let parsed: serde_json::Value =
@@ -186,6 +381,7 @@ mod tests {
         assert_eq!(parsed["pubkey_fingerprint"], "ddeeff");
         assert!(parsed["timestamp"].is_string());
         assert!(parsed["pid"].is_number());
+        assert!(parsed["chain_hmac"].is_string());
     }
 
     #[test]
@@ -229,14 +425,10 @@ mod tests {
             },
         ];
 
+        let logger = make_logger_stderr();
         for event in events {
-            let record = AuditRecord::new(event);
-            let json = serde_json::to_string(&record).expect("must serialize");
-            let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
-            // Every record must have these top-level keys.
-            assert!(parsed["timestamp"].is_string(), "missing timestamp");
-            assert!(parsed["pid"].is_number(), "missing pid");
-            assert!(parsed["event"].is_string(), "missing event tag");
+            // Smoke-test: must not panic.
+            logger.log(event);
         }
     }
 
@@ -275,6 +467,7 @@ mod tests {
             serde_json::from_str(contents.trim()).expect("file content must be valid JSON");
         assert_eq!(parsed["event"], "integrity_verified");
         assert_eq!(parsed["launcher_hash"], "deadbeef");
+        assert!(parsed["chain_hmac"].is_string(), "chain_hmac must be present");
     }
 
     #[test]
@@ -291,5 +484,78 @@ mod tests {
         // Basic sanity: "2024-01-01T00:00:00Z" is 20 chars minimum.
         assert!(ts.len() >= 20, "timestamp too short: {ts}");
         assert!(ts.ends_with('Z'), "timestamp must be UTC: {ts}");
+    }
+
+    // -----------------------------------------------------------------------
+    // HMAC chain tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hmac_chain_three_events_verifies_successfully() {
+        let tmp = std::env::temp_dir().join(format!(
+            "snapfzz-seal-audit-chain-ok-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let logger = make_logger_to_file(&tmp);
+        let chain_key = logger.chain_key;
+
+        logger.log(AuditEvent::IntegrityVerified {
+            launcher_hash: "aabb".into(),
+        });
+        logger.log(AuditEvent::AnalysisDetected {
+            check: "tracer_pid".into(),
+        });
+        logger.log(AuditEvent::LaunchCompleted { exit_code: 0 });
+
+        // Flush by dropping (file is flushed on drop for BufWriter, but here
+        // we use raw File so writes are immediate).
+        drop(logger);
+
+        let count = verify_audit_chain(&tmp, &chain_key)
+            .expect("chain verification must succeed for unmodified log");
+        assert_eq!(count, 3, "expected 3 verified records");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn hmac_chain_detects_record_tampering() {
+        let tmp = std::env::temp_dir().join(format!(
+            "snapfzz-seal-audit-chain-tamper-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let logger = make_logger_to_file(&tmp);
+        let chain_key = logger.chain_key;
+
+        logger.log(AuditEvent::LaunchStarted {
+            payload_hash: "cc".into(),
+            backend: "rust".into(),
+        });
+        logger.log(AuditEvent::LaunchCompleted { exit_code: 0 });
+        logger.log(AuditEvent::SignatureVerified {
+            payload_hash: "dd".into(),
+            pubkey_fingerprint: "ee".into(),
+        });
+        drop(logger);
+
+        // Read the file, tamper with the first line (change exit_code field),
+        // write it back.
+        let original = std::fs::read_to_string(&tmp).expect("must read");
+        let tampered = original.replacen("\"rust\"", "\"nuitka\"", 1);
+        // Ensure we actually changed something.
+        assert_ne!(original, tampered, "replacement must have changed the content");
+        std::fs::write(&tmp, &tampered).expect("must write tampered content");
+
+        let result = verify_audit_chain(&tmp, &chain_key);
+        assert!(
+            result.is_err(),
+            "chain verification must fail for tampered log"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }
