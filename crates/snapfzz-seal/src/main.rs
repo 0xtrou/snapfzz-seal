@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod compile;
+mod fingerprint;
 mod keygen;
 mod launch;
 mod server;
@@ -19,6 +20,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Compile(compile::Cli),
+    Fingerprint(fingerprint::Cli),
     Keygen(keygen::Cli),
     Launch(launch::Cli),
     Server(server::Cli),
@@ -34,6 +36,7 @@ fn main() {
 
     let result = match cli.command {
         Command::Compile(cli) => compile::run(cli),
+        Command::Fingerprint(cli) => fingerprint::run(cli),
         Command::Keygen(cli) => keygen::run(cli),
         Command::Launch(cli) => launch::run(cli),
         Command::Server(cli) => server::run(cli),
