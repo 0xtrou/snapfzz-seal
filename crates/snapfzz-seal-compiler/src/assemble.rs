@@ -55,7 +55,8 @@ pub fn assemble(config: &AssembleConfig) -> Result<Vec<u8>, SealError> {
     let launcher_with_whitebox = embed_whitebox_tables(&launcher_with_tamper, &whitebox_tables)?;
 
     let regions = find_integrity_regions(&launcher_with_whitebox)?;
-    let _launcher_integrity_hash = compute_binary_integrity_hash(&launcher_with_whitebox, &regions)?;
+    let _launcher_integrity_hash =
+        compute_binary_integrity_hash(&launcher_with_whitebox, &regions)?;
 
     let integrity_key = derive_key_with_integrity_from_binary(&env_key, &launcher_with_whitebox)?;
 
