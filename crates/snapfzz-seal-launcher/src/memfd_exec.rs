@@ -565,12 +565,13 @@ fn run_memfd_child<Ops: MemfdOps>(ops: &Ops, binary_data: &[u8], config: &ExecCo
             );
         }
 
-        // NOTE: Seccomp temporarily disabled for E2E testing
-        // Go/Python runtime needs syscalls not yet enumerated in allowlist
-        // TODO: Comprehensive syscall profiling for Go/Python agents
-        // if let Err(err) = crate::seccomp::apply_seccomp_filter() {
-        //     eprintln!("seccomp filter failed: {err} (continuing without seccomp)");
-        // }
+        // Seccomp filter: comprehensive allowlist covering Go and Python batch
+        // agent runtimes. Categories: I/O, filesystem, memory, process/thread
+        // lifecycle, credentials, scheduling, futex, signals, time, polling,
+        // networking, IPC, system info, entropy/security, memfd/PyInstaller.
+        if let Err(err) = crate::seccomp::apply_seccomp_filter() {
+            eprintln!("seccomp filter failed: {err} (continuing without seccomp)");
+        }
     }
 
     let exec_result = (|| -> Result<(), SealError> {
