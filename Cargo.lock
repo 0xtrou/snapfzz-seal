@@ -1962,6 +1962,7 @@ dependencies = [
  "sha2",
  "snapfzz-seal-core",
  "snapfzz-seal-fingerprint",
+ "subtle",
  "tracing",
  "tracing-subscriber",
  "zeroize",

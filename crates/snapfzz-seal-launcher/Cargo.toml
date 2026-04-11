@@ -20,6 +20,7 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
+subtle = { workspace = true }
 sha2 = "0.10"
 chrono = "0.4"
 
