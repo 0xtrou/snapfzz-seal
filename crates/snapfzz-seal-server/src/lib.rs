@@ -92,8 +92,7 @@ mod tests {
     #[tokio::test]
     async fn wrong_bearer_token_returns_401_on_api_route() {
         let app = create_app(state_with_key("my-secret"));
-        let status =
-            get_status(app, "/api/v1/jobs/nonexistent", Some("Bearer wrong-secret")).await;
+        let status = get_status(app, "/api/v1/jobs/nonexistent", Some("Bearer wrong-secret")).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 

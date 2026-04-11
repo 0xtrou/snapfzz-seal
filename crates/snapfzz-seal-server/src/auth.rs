@@ -108,10 +108,7 @@ where
             .and_then(|s| s.strip_prefix("Bearer "))
             .map(|provided| {
                 // Constant-time comparison.
-                provided
-                    .as_bytes()
-                    .ct_eq(expected.as_bytes())
-                    .into()
+                provided.as_bytes().ct_eq(expected.as_bytes()).into()
             })
             .unwrap_or(false);
 

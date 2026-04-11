@@ -357,8 +357,7 @@ fn eval_polynomial(coefficients: &[FieldElement], x: FieldElement) -> FieldEleme
 
 /// Returns `Choice::from(1)` iff all four limbs are zero.
 fn ct_is_zero(limbs: &[u64; 4]) -> Choice {
-    let any_nonzero =
-        (limbs[0] | limbs[1] | limbs[2] | limbs[3]) != 0;
+    let any_nonzero = (limbs[0] | limbs[1] | limbs[2] | limbs[3]) != 0;
     Choice::from(!any_nonzero as u8)
 }
 
@@ -625,10 +624,9 @@ mod tests {
                 // Either returns NotEnoughShares error, or recovers wrong value.
                 match reconstruct_secret(&subset, 3) {
                     Err(ShamirError::NotEnoughShares) => {}
-                    Ok(recovered) => assert_ne!(
-                        recovered, secret,
-                        "2 shares should NOT recover the secret"
-                    ),
+                    Ok(recovered) => {
+                        assert_ne!(recovered, secret, "2 shares should NOT recover the secret")
+                    }
                     Err(e) => panic!("unexpected error: {e}"),
                 }
             }

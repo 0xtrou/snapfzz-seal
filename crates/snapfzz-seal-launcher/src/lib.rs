@@ -111,9 +111,7 @@ fn verify_signature(raw_binary: &[u8], audit: &audit::AuditLogger) -> Result<(),
     #[cfg(not(feature = "skip-pubkey-pin"))]
     if let Some(pinned_hex) = ROOT_PUBKEY_HEX {
         let pinned_bytes = hex::decode(pinned_hex).map_err(|_| {
-            SealError::InvalidInput(
-                "SNAPFZZ_SEAL_ROOT_PUBKEY_HEX is not valid hex".to_string(),
-            )
+            SealError::InvalidInput("SNAPFZZ_SEAL_ROOT_PUBKEY_HEX is not valid hex".to_string())
         })?;
         if pinned_bytes.len() != 32 {
             return Err(SealError::InvalidInput(

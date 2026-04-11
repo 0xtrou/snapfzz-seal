@@ -245,8 +245,8 @@ impl AuditLogger {
 /// Returns `Ok(n)` where `n` is the number of records verified, or
 /// `Err(description)` on the first integrity failure.
 pub fn verify_audit_chain(path: &Path, chain_key: &[u8; 32]) -> Result<usize, String> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| format!("could not read audit log: {e}"))?;
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("could not read audit log: {e}"))?;
 
     let mut prev_hmac = [0u8; 32]; // genesis
     let mut count = 0usize;
@@ -273,8 +273,8 @@ pub fn verify_audit_chain(path: &Path, chain_key: &[u8; 32]) -> Result<usize, St
             .ok_or_else(|| format!("line {}: could not re-serialize body", line_no + 1))?;
 
         // Compute expected HMAC.
-        let mut mac = HmacSha256::new_from_slice(chain_key)
-            .map_err(|e| format!("HMAC init error: {e}"))?;
+        let mut mac =
+            HmacSha256::new_from_slice(chain_key).map_err(|e| format!("HMAC init error: {e}"))?;
         mac.update(&prev_hmac);
         mac.update(body_json.as_bytes());
         let expected = mac.finalize().into_bytes();
@@ -467,7 +467,10 @@ mod tests {
             serde_json::from_str(contents.trim()).expect("file content must be valid JSON");
         assert_eq!(parsed["event"], "integrity_verified");
         assert_eq!(parsed["launcher_hash"], "deadbeef");
-        assert!(parsed["chain_hmac"].is_string(), "chain_hmac must be present");
+        assert!(
+            parsed["chain_hmac"].is_string(),
+            "chain_hmac must be present"
+        );
     }
 
     #[test]
@@ -547,7 +550,10 @@ mod tests {
         let original = std::fs::read_to_string(&tmp).expect("must read");
         let tampered = original.replacen("\"rust\"", "\"nuitka\"", 1);
         // Ensure we actually changed something.
-        assert_ne!(original, tampered, "replacement must have changed the content");
+        assert_ne!(
+            original, tampered,
+            "replacement must have changed the content"
+        );
         std::fs::write(&tmp, &tampered).expect("must write tampered content");
 
         let result = verify_audit_chain(&tmp, &chain_key);

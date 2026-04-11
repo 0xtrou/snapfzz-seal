@@ -750,9 +750,13 @@ mod tests {
             backend_type: BackendType::Go,
         };
 
-        let payload =
-            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
-                .expect("pack with footer should succeed");
+        let payload = pack_payload_with_footer(
+            Cursor::new(plaintext),
+            &key,
+            AgentMode::Batch,
+            Some(&footer),
+        )
+        .expect("pack with footer should succeed");
         let (decrypted, header) =
             unpack_payload_with_footer(Cursor::new(payload), &key, Some(&footer))
                 .expect("unpack with footer should succeed");
@@ -771,9 +775,13 @@ mod tests {
             backend_type: BackendType::Go,
         };
 
-        let payload =
-            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
-                .expect("pack should succeed");
+        let payload = pack_payload_with_footer(
+            Cursor::new(plaintext),
+            &key,
+            AgentMode::Batch,
+            Some(&footer),
+        )
+        .expect("pack should succeed");
 
         // Attacker flips backend_type from Go (0x01) to PyInstaller (0x02)
         let tampered_footer = PayloadFooter {
@@ -797,9 +805,13 @@ mod tests {
             backend_type: BackendType::Nuitka,
         };
 
-        let payload =
-            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
-                .expect("pack should succeed");
+        let payload = pack_payload_with_footer(
+            Cursor::new(plaintext),
+            &key,
+            AgentMode::Batch,
+            Some(&footer),
+        )
+        .expect("pack should succeed");
 
         // Unpack without footer should fail: HMAC was computed with footer bytes
         let err = unpack_payload(Cursor::new(payload), &key)
@@ -837,9 +849,13 @@ mod tests {
             backend_type: BackendType::Go,
         };
 
-        let payload =
-            pack_payload_with_footer(Cursor::new(plaintext), &key, AgentMode::Batch, Some(&footer))
-                .expect("pack should succeed");
+        let payload = pack_payload_with_footer(
+            Cursor::new(plaintext),
+            &key,
+            AgentMode::Batch,
+            Some(&footer),
+        )
+        .expect("pack should succeed");
 
         let tampered_footer = PayloadFooter {
             original_hash: [0x78; 32], // flip one byte
