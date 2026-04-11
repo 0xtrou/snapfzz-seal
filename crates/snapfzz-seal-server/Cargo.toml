@@ -20,5 +20,7 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
+subtle = { workspace = true }
+futures = { workspace = true }
 async-trait = "0.1"
 regex = "1"

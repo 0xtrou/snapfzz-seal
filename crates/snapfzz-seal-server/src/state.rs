@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::auth::ApiKey;
 use crate::sandbox::{DockerBackend, SandboxBackend};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,16 +40,27 @@ pub struct ServerState {
     pub compile_dir: PathBuf,
     pub output_dir: PathBuf,
     pub sandbox_backend: Arc<dyn SandboxBackend>,
+    /// API key used by the Bearer auth middleware.  `None` = dev mode.
+    pub api_key: ApiKey,
 }
 
 impl ServerState {
+    /// Create a new state with no API key (dev mode).  Use
+    /// [`ServerState::with_api_key`] or set `api_key` directly to enable auth.
     pub fn new(compile_dir: PathBuf, output_dir: PathBuf) -> Self {
         Self {
             jobs: Arc::new(RwLock::new(HashMap::new())),
             compile_dir,
             output_dir,
             sandbox_backend: Arc::new(DockerBackend::new()),
+            api_key: None,
         }
+    }
+
+    /// Create state with an explicit API key.
+    pub fn with_api_key(mut self, api_key: ApiKey) -> Self {
+        self.api_key = api_key;
+        self
     }
 
     pub async fn get_job(&self, id: &str) -> Option<JobStatus> {

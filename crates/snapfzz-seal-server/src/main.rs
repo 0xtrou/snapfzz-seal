@@ -27,7 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&cli.compile_dir).await?;
     tokio::fs::create_dir_all(&cli.output_dir).await?;
 
-    let state = snapfzz_seal_server::state::ServerState::new(cli.compile_dir, cli.output_dir);
+    let api_key = snapfzz_seal_server::auth::load_api_key();
+    let state = snapfzz_seal_server::state::ServerState::new(cli.compile_dir, cli.output_dir)
+        .with_api_key(api_key);
     let app = snapfzz_seal_server::create_app(state);
 
     let bind_addr: SocketAddr = cli.bind.parse()?;

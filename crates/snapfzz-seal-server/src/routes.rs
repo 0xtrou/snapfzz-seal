@@ -15,6 +15,7 @@ use serde_json::json;
 use snapfzz_seal_compiler::{Cli as CompilerCli, CliBackend};
 use tracing::debug;
 
+use crate::auth::BearerAuthLayer;
 use crate::sandbox::{SandboxConfig, copy_into_sandbox, exec_in_sandbox};
 use crate::state::{JobState, ServerState};
 
@@ -89,11 +90,15 @@ pub struct JobResultResponse {
 }
 
 pub fn build_router(state: ServerState) -> Router {
-    Router::new()
+    let api_routes = Router::new()
         .route("/api/v1/compile", post(compile))
         .route("/api/v1/dispatch", post(dispatch))
         .route("/api/v1/jobs/{job_id}", get(get_job))
         .route("/api/v1/jobs/{job_id}/results", get(get_results))
+        .layer(BearerAuthLayer::new(state.api_key.clone()));
+
+    Router::new()
+        .merge(api_routes)
         .route("/health", get(health))
         .with_state(state)
 }
