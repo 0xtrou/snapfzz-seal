@@ -1356,7 +1356,7 @@ mod path_validation_tests {
 
     #[test]
     fn rejects_nonexistent_path() {
-        let tmp = std::env::temp_dir().join("snapfzz-seal-pv-test");
+        let tmp = std::env::temp_dir().join("snapfzz-seal-pv-reject");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let result = validate_project_dir("/nonexistent/path/12345", &tmp);
@@ -1366,7 +1366,7 @@ mod path_validation_tests {
 
     #[test]
     fn accepts_path_within_base() {
-        let tmp = std::env::temp_dir().join("snapfzz-seal-pv-test");
+        let tmp = std::env::temp_dir().join("snapfzz-seal-pv-accept");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let inner = tmp.join("project");

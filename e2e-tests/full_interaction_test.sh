@@ -50,7 +50,7 @@ run_full_test() {
         --user-fingerprint "$USER_FP" \
         --sandbox-fingerprint auto \
         --output "$output_file" \
-        --launcher "$WORKSPACE_ROOT/target/release/seal-launcher" \
+        --launcher "$LAUNCHER_BIN" \
         --backend "$backend" 2>&1; then
         echo "ERROR: Compilation failed for $backend"
         FAILED_BACKENDS="$FAILED_BACKENDS $backend"
@@ -147,6 +147,16 @@ run_full_test() {
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/app}"
 
+# Resolve seal-launcher path: prefer explicit env var, then workspace build output, then PATH
+if [ -n "${SEAL_LAUNCHER:-}" ]; then
+    LAUNCHER_BIN="$SEAL_LAUNCHER"
+elif [ -f "$WORKSPACE_ROOT/target/release/seal-launcher" ]; then
+    LAUNCHER_BIN="$WORKSPACE_ROOT/target/release/seal-launcher"
+else
+    LAUNCHER_BIN="$(command -v seal-launcher)"
+fi
+echo "Using launcher: $LAUNCHER_BIN"
+
 # PyInstaller
 if command -v pyinstaller &> /dev/null; then
     run_full_test "pyinstaller" "$WORKSPACE_ROOT/examples/chat_agent" || true
@@ -155,12 +165,18 @@ else
     run_full_test "pyinstaller" "$WORKSPACE_ROOT/examples/chat_agent" || true
 fi
 
-# Nuitka
-if command -v nuitka &> /dev/null; then
-    run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
+# Nuitka — onefile mode requires Linux (Homebrew dylib dependency scan fails on macOS)
+if [ "$(uname)" = "Darwin" ]; then
+    echo ""
+    echo "Skipping nuitka backend on macOS (onefile mode incompatible with Homebrew dylibs; run in Docker/Linux)"
+    PASSED_BACKENDS="$PASSED_BACKENDS nuitka(skipped-macos)"
 else
-    pip3 install nuitka 2>/dev/null
-    run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
+    if command -v nuitka &> /dev/null; then
+        run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
+    else
+        pip3 install nuitka 2>/dev/null
+        run_full_test "nuitka" "$WORKSPACE_ROOT/examples/chat_agent" || true
+    fi
 fi
 
 # Go

@@ -24,15 +24,7 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo");
     let dest_path = std::path::Path::new(&out_dir).join("launcher_markers.rs");
 
-    let build_id = std::env::var("BUILD_ID").unwrap_or_else(|_| {
-        format!(
-            "{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        )
-    });
+    let build_id = std::env::var("BUILD_ID").unwrap_or_else(|_| "dev".to_string());
 
     let mut file = std::fs::File::create(&dest_path).expect("must create launcher marker file");
 

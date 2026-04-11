@@ -12,11 +12,9 @@ echo "Backend: $BACKEND"
 echo "BUILD_ID: $BUILD_ID"
 echo ""
 
-# Build if needed
-if [ ! -f ./target/release/seal ]; then
-    echo "Building release binaries..."
-    BUILD_ID="$BUILD_ID" cargo build --release
-fi
+# Always rebuild to ensure BUILD_ID consistency between seal and seal-launcher
+echo "Building release binaries..."
+BUILD_ID="$BUILD_ID" cargo build --release
 
 # Generate test user/sandbox fingerprints
 USER_FP=$(openssl rand -hex 32)
@@ -33,11 +31,18 @@ mkdir -p "$KEYS_DIR"
 echo "Keys generated in: $KEYS_DIR"
 echo ""
 
+# Select project based on backend
+if [ "$BACKEND" = "go" ]; then
+    PROJECT="./examples/go_agent"
+else
+    PROJECT="./examples/chat_agent"
+fi
+
 # Compile
 echo "Compiling with $BACKEND..."
 OUTPUT="/tmp/agent-$BACKEND-$$.sealed"
 ./target/release/seal compile \
-    --project ./examples/chat_agent \
+    --project "$PROJECT" \
     --user-fingerprint "$USER_FP" \
     --sandbox-fingerprint "$SANDBOX_FP" \
     --output "$OUTPUT" \

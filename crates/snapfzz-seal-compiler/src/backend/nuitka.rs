@@ -54,10 +54,38 @@ impl CompileBackend for NuitkaBackend {
 }
 
 pub fn compile_with_nuitka(config: &NuitkaConfig) -> Result<PathBuf, SealError> {
-    compile_with_command("nuitka", config)
+    let (base_cmd, display_name) = resolve_nuitka_command();
+    compile_with_base_command(base_cmd, &display_name, config)
 }
 
+/// Returns (base Command, display name for error messages).
+/// Prefers the standalone `nuitka` binary; falls back to `python3 -m nuitka`.
+fn resolve_nuitka_command() -> (Command, String) {
+    if Command::new("nuitka")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+    {
+        (Command::new("nuitka"), "nuitka".to_string())
+    } else {
+        let mut cmd = Command::new("python3");
+        cmd.args(["-m", "nuitka"]);
+        (cmd, "python3 -m nuitka".to_string())
+    }
+}
+
+#[cfg(test)]
 fn compile_with_command(command_name: &str, config: &NuitkaConfig) -> Result<PathBuf, SealError> {
+    compile_with_base_command(Command::new(command_name), command_name, config)
+}
+
+fn compile_with_base_command(
+    mut command: Command,
+    display_name: &str,
+    config: &NuitkaConfig,
+) -> Result<PathBuf, SealError> {
     // Validate project directory before attempting compilation
     if !config.project_dir.is_dir() {
         return Err(SealError::InvalidInput(format!(
@@ -74,7 +102,6 @@ fn compile_with_command(command_name: &str, config: &NuitkaConfig) -> Result<Pat
         )));
     }
 
-    let mut command = Command::new(command_name);
     if config.standalone {
         command.arg("--standalone");
     }
@@ -84,12 +111,14 @@ fn compile_with_command(command_name: &str, config: &NuitkaConfig) -> Result<Pat
     if config.remove_output {
         command.arg("--remove-output");
     }
+    // Required for pyenv and other shared-libpython environments
+    command.arg("--static-libpython=no");
 
     command
         .arg(format!("--output-dir={}", config.output_dir.display()))
         .arg(&main_py);
 
-    let output = run_with_timeout(command, config.timeout_secs, command_name)?;
+    let output = run_with_timeout(command, config.timeout_secs, display_name)?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);

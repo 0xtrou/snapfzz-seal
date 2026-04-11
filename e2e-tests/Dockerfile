@@ -1,7 +1,7 @@
 # E2E Test Environment for Snapfzz Seal
 # Builds and tests all backends in an Alpine Linux container
 
-FROM rust:1.86-alpine AS builder
+FROM rust:1.88-alpine AS builder
 
 RUN apk add --no-cache \
     musl-dev \
