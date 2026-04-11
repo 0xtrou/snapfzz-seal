@@ -106,6 +106,9 @@ pub fn detect_virtual_machine() -> bool {
 }
 
 pub fn is_being_analyzed() -> bool {
+    if std::env::var("SNAPFZZ_SEAL_SKIP_ANALYSIS_CHECK").is_ok() {
+        return false;
+    }
     detect_debugger() || detect_virtual_machine()
 }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

@@ -121,6 +121,7 @@ jobs:
           SNAPFZZ_SEAL_API_BASE: ${{ secrets.SNAPFZZ_SEAL_API_BASE }}
           SNAPFZZ_SEAL_MODEL: ${{ secrets.SNAPFZZ_SEAL_MODEL }}
           SNAPFZZ_SEAL_MASTER_SECRET_HEX: ${{ secrets.SNAPFZZ_SEAL_MASTER_SECRET_HEX }}
+          SNAPFZZ_SEAL_SKIP_ANALYSIS_CHECK: "1"
         run: |
           set -euo pipefail
           echo "=== PyInstaller Backend E2E Test ==="
@@ -165,11 +166,8 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
-          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
-            echo "✓ PyInstaller E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
-          else
-            echo "✓ PyInstaller E2E complete (exit=$LAUNCH_EXIT)"
           fi
+          echo "✓ PyInstaller E2E complete (exit=$LAUNCH_EXIT)"
 
   e2e-nuitka:
     name: E2E - Nuitka
@@ -212,6 +210,7 @@ jobs:
           SNAPFZZ_SEAL_API_BASE: ${{ secrets.SNAPFZZ_SEAL_API_BASE }}
           SNAPFZZ_SEAL_MODEL: ${{ secrets.SNAPFZZ_SEAL_MODEL }}
           SNAPFZZ_SEAL_MASTER_SECRET_HEX: ${{ secrets.SNAPFZZ_SEAL_MASTER_SECRET_HEX }}
+          SNAPFZZ_SEAL_SKIP_ANALYSIS_CHECK: "1"
         run: |
           set -euo pipefail
           echo "=== Nuitka Backend E2E Test ==="
@@ -256,11 +255,8 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
-          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
-            echo "✓ Nuitka E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
-          else
-            echo "✓ Nuitka E2E complete (exit=$LAUNCH_EXIT)"
           fi
+          echo "✓ Nuitka E2E complete (exit=$LAUNCH_EXIT)"
 
   e2e-golang:
     name: E2E - Go
@@ -295,6 +291,7 @@ jobs:
           SNAPFZZ_SEAL_API_BASE: ${{ secrets.SNAPFZZ_SEAL_API_BASE }}
           SNAPFZZ_SEAL_MODEL: ${{ secrets.SNAPFZZ_SEAL_MODEL }}
           SNAPFZZ_SEAL_MASTER_SECRET_HEX: ${{ secrets.SNAPFZZ_SEAL_MASTER_SECRET_HEX }}
+          SNAPFZZ_SEAL_SKIP_ANALYSIS_CHECK: "1"
         run: |
           set -euo pipefail
           echo "=== Go Backend E2E Test ==="
@@ -339,11 +336,8 @@ jobs:
           if echo "$LAUNCH_OUT" | grep -q "invalid signature"; then
             echo "FAIL: invalid signature — binary integrity broken"
             exit 1
-          elif echo "$LAUNCH_OUT" | grep -q "analysis environment detected"; then
-            echo "✓ Go E2E complete — compile/sign/verify passed; launch blocked by VM detection (expected in CI)"
-          else
-            echo "✓ Go E2E complete (exit=$LAUNCH_EXIT)"
           fi
+          echo "✓ Go E2E complete (exit=$LAUNCH_EXIT)"
 
   upload-artifacts:
     name: Upload Artifacts

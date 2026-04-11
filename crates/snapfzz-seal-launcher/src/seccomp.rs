@@ -174,7 +174,7 @@ pub(crate) fn apply_seccomp_filter() -> Result<(), SealError> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-#[allow(unsafe_code)]
+#[allow(unsafe_code, dead_code)]
 pub(crate) fn apply_seccomp_filter() -> Result<(), SealError> {
     Ok(())
 }
