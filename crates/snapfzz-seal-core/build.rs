@@ -13,7 +13,18 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR must be set by Cargo");
     let dest_path = std::path::Path::new(&out_dir).join("generated_markers.rs");
 
-    let build_id = std::env::var("BUILD_ID").unwrap_or_else(|_| "dev".to_string());
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    let build_id = match std::env::var("BUILD_ID") {
+        Ok(id) => id,
+        Err(_) => {
+            if profile == "release" {
+                panic!(
+                    "BUILD_ID environment variable must be set for release builds. Set it to a unique build identifier (e.g. git SHA)."
+                );
+            }
+            "dev".to_string()
+        }
+    };
 
     let mut file = std::fs::File::create(&dest_path).expect("must create generated marker file");
 
