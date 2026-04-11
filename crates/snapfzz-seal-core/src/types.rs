@@ -57,19 +57,14 @@ pub struct PayloadFooter {
     pub backend_type: BackendType,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum BackendType {
+    #[default]
     Unknown = 0,
     Go = 1,
     PyInstaller = 2,
     Nuitka = 3,
-}
-
-impl Default for BackendType {
-    fn default() -> Self {
-        BackendType::Unknown
-    }
 }
 
 impl BackendType {

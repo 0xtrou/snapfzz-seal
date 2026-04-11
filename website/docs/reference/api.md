@@ -129,7 +129,7 @@ Dispatch a compiled and ready artifact to a Docker sandbox for execution.
 
 ---
 
-### GET /api/v1/jobs/{job_id}
+### GET /api/v1/jobs/&#123;job_id&#125;
 
 Retrieve the current status and metadata for a job.
 
@@ -187,7 +187,7 @@ Retrieve the current status and metadata for a job.
 
 ---
 
-### GET /api/v1/jobs/{job_id}/results
+### GET /api/v1/jobs/&#123;job_id&#125;/results
 
 Retrieve the execution result for a job. Returns the same job for any existing job ID regardless of state; `result` is `null` until execution completes.
 
