@@ -28,7 +28,13 @@ pub fn compile_agent_with_backend(
         timeout_secs: 1_800,
     };
     let output = backend.compile(&config)?;
-    run_strip(&output)?;
+
+    // Nuitka onefile binaries MUST NOT be stripped - strip destroys attached payload data
+    // See: https://github.com/Nuitka/Nuitka/issues/3231
+    if backend.name() != "nuitka" {
+        run_strip(&output)?;
+    }
+
     verify_non_empty(&output)?;
     Ok(output)
 }
